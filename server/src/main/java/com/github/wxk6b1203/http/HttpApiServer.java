@@ -94,6 +94,9 @@ public class HttpApiServer implements AutoCloseable {
     private final Map<String, CoordinatingPit> pits = new ConcurrentHashMap<>();
     private final Set<String> maintenanceTasksRunning = ConcurrentHashMap.newKeySet();
     private final ExecutorService maintenanceExecutor;
+    private final SnapshotReadinessCache snapshotReadinessCache = new SnapshotReadinessCache();
+    private volatile long lastMetricsRefreshNanos;
+    private static final long METRICS_REFRESH_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(5);
     private Long maintenanceTimerId;
     private Long writeMaintenanceTimerId;
     private S3Client s3Client;
@@ -182,6 +185,7 @@ public class HttpApiServer implements AutoCloseable {
         this.manifestMetadataManager = options.etcdEnabled()
                 ? new EtcdManifestMetadataManager(EtcdManifestMetadataManager.Options.builder()
                 .namespace(options.etcdNamespace() + "/manifest")
+                .operationTimeoutSeconds(options.etcdTimeoutSeconds())
                 .build(), etcdClient)
                 : new MemMockProvider();
         Path dataPath = Path.of(options.dataPath());
@@ -445,6 +449,9 @@ public class HttpApiServer implements AutoCloseable {
                     "settings.index.number_of_shards",
                     "settings.index.numberOfShards"
             ), 1);
+            if (shards <= 0) {
+                throw new IllegalArgumentException("number_of_shards must be greater than zero");
+            }
             int redundantCopies = intValue(indexSetting(body,
                     "number_of_replicas",
                     "numberOfReplicas",
@@ -568,6 +575,7 @@ public class HttpApiServer implements AutoCloseable {
         if (!writeBackpressure.acquire(context)) {
             return;
         }
+        boolean released = false;
         try {
             String index = context.pathParam("index");
             String id = documentId(context);
@@ -596,7 +604,9 @@ public class HttpApiServer implements AutoCloseable {
                 }
                 Map<String, String> headers = new HashMap<>(writeFenceHeaders(route));
                 headers.put(DOCUMENT_ID_HEADER, id);
-                forward(context, route.nodeId(), route.host(), route.httpPort(), headers);
+                // Backpressure is released inside the forwarding callback once the forwarded write completes.
+                forwardAndReleaseBackpressure(context, route.nodeId(), route.host(), route.httpPort(), headers);
+                released = true;
                 return;
             }
             if (context.request().getHeader(FORWARDED_HEADER) != null) {
@@ -616,7 +626,9 @@ public class HttpApiServer implements AutoCloseable {
         } catch (Exception e) {
             error(context, status(e), e);
         } finally {
-            writeBackpressure.release();
+            if (!released) {
+                writeBackpressure.release();
+            }
         }
     }
 
@@ -624,6 +636,7 @@ public class HttpApiServer implements AutoCloseable {
         if (!writeBackpressure.acquire(context)) {
             return;
         }
+        boolean released = false;
         try {
             String index = context.pathParam("index");
             String id = context.pathParam("id");
@@ -645,7 +658,8 @@ public class HttpApiServer implements AutoCloseable {
                     throw new IllegalStateException("forwarded write request did not reach shard owner node: "
                             + route.shardId().routeKey());
                 }
-                forward(context, route.nodeId(), route.host(), route.httpPort(), writeFenceHeaders(route));
+                forwardAndReleaseBackpressure(context, route.nodeId(), route.host(), route.httpPort(), writeFenceHeaders(route));
+                released = true;
                 return;
             }
             if (context.request().getHeader(FORWARDED_HEADER) != null) {
@@ -662,7 +676,9 @@ public class HttpApiServer implements AutoCloseable {
         } catch (Exception e) {
             error(context, status(e), e);
         } finally {
-            writeBackpressure.release();
+            if (!released) {
+                writeBackpressure.release();
+            }
         }
     }
 
@@ -799,6 +815,7 @@ public class HttpApiServer implements AutoCloseable {
                     })
                     .onSuccess(response -> json(context, 200, response))
                     .onFailure(e -> {
+                        rollbackOpenedShardPits(futures);
                         Exception exception = exception(e);
                         error(context, status(exception), exception);
                     });
@@ -1074,11 +1091,14 @@ public class HttpApiServer implements AutoCloseable {
             Map<String, Integer> load
     ) {
         ShardRouting routing = routingFor(base.shardId(), state);
-        IndexCommitSnapshot snapshot = latestRemoteSnapshot(base.shardId());
+        boolean remoteReady = snapshotReadinessCache.getOrLoad(base.shardId());
         if (consistency.equalsIgnoreCase("strong")
-                || (weakRemoteSnapshotReadsEnabled && remoteSnapshotReady(base.shardId(), snapshot))) {
+                || (weakRemoteSnapshotReadsEnabled && remoteReady)) {
             ClusterNode node = leastLoaded(dataNodes, load);
             load.merge(node.id(), 1, Integer::sum);
+            // The readiness flag is cached (it only flips false->true), but the generation must be
+            // fetched live so a weak read immediately after a write sees the freshest snapshot.
+            IndexCommitSnapshot snapshot = manifestMetadataManager.latestSnapshot(physicalIndexName(base.shardId()));
             return new SearchShardTarget(
                     base.shardId(),
                     node.id(),
@@ -1107,30 +1127,6 @@ public class HttpApiServer implements AutoCloseable {
                 false,
                 null
         );
-    }
-
-    private boolean remoteSnapshotReady(ShardId shardId) {
-        return remoteSnapshotReady(shardId, latestRemoteSnapshot(shardId));
-    }
-
-    private boolean remoteSnapshotReady(ShardId shardId, IndexCommitSnapshot snapshot) {
-        if (snapshot == null) {
-            return false;
-        }
-        String physicalIndexName = physicalIndexName(shardId);
-        return manifestMetadataManager.listAll(physicalIndexName, List.of(
-                        IndexFileStatus.DIRTY,
-                        IndexFileStatus.UPLOADING,
-                        IndexFileStatus.CLEAN,
-                        IndexFileStatus.PINNED
-                ))
-                .stream()
-                .noneMatch(metadata -> metadata.getStatus() == IndexFileStatus.DIRTY
-                        || metadata.getStatus() == IndexFileStatus.UPLOADING);
-    }
-
-    private IndexCommitSnapshot latestRemoteSnapshot(ShardId shardId) {
-        return manifestMetadataManager.latestSnapshot(physicalIndexName(shardId));
     }
 
     private ShardRouting routingFor(ShardId shardId, ClusterState state) {
@@ -1532,6 +1528,23 @@ public class HttpApiServer implements AutoCloseable {
             return Future.succeededFuture();
         }
         return Future.all(futures).mapEmpty();
+    }
+
+    private void rollbackOpenedShardPits(List<Future<ShardPit>> futures) {
+        for (Future<ShardPit> future : futures) {
+            if (!future.succeeded()) {
+                continue;
+            }
+            ShardPit shardPit = future.result();
+            try {
+                executeShardClosePit(shardPit.target(), shardPit.pitId())
+                        .onFailure(e -> log.warn("failed to roll back shard pit {}/{}",
+                                shardPit.target().shardId().routeKey(), shardPit.pitId(), e));
+            } catch (Exception e) {
+                log.warn("failed to submit shard pit rollback {}/{}",
+                        shardPit.target().shardId().routeKey(), shardPit.pitId(), e);
+            }
+        }
     }
 
     private Future<ByQueryResponse> executeDeleteByQueryPlan(SearchPlan plan, ByQueryRequest request) {
@@ -2006,6 +2019,7 @@ public class HttpApiServer implements AutoCloseable {
             }
             submitMaintenanceTask(task.name(), () -> maintenanceService.run(task));
         }
+        submitMaintenanceTask("snapshot-readiness-refresh", this::refreshSnapshotReadiness);
         submitMaintenanceTask("metrics-refresh", this::refreshRuntimeMetrics);
     }
 
@@ -2039,6 +2053,11 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private void refreshRuntimeMetrics() {
+        long now = System.nanoTime();
+        if (now - lastMetricsRefreshNanos < METRICS_REFRESH_INTERVAL_NANOS) {
+            return;
+        }
+        lastMetricsRefreshNanos = now;
         try {
             ClusterState state = clusterStateRepository.current();
             Map<String, Object> uploads = maintenanceService.uploadStatus(null);
@@ -2079,6 +2098,14 @@ public class HttpApiServer implements AutoCloseable {
             localShardIndexService.cleanupIdleResources();
         } catch (IOException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private void refreshSnapshotReadiness() {
+        try {
+            snapshotReadinessCache.refresh(clusterStateRepository.current());
+        } catch (IOException e) {
+            log.debug("failed to refresh remote snapshot readiness cache", e);
         }
     }
 
@@ -2162,6 +2189,40 @@ public class HttpApiServer implements AutoCloseable {
 
     private void forward(RoutingContext context, String targetNodeId, String targetHost, int targetPort) {
         forward(context, targetNodeId, targetHost, targetPort, Map.of());
+    }
+
+    /**
+     * Forward a write request to the shard owner and release write backpressure only after the
+     * forwarded request has completed. This keeps the coordinating node's concurrency limit
+     * accurate for in-flight forwarded writes instead of releasing the slot the moment the
+     * forward is dispatched.
+     */
+    private void forwardAndReleaseBackpressure(
+            RoutingContext context,
+            String targetNodeId,
+            String targetHost,
+            int targetPort,
+            Map<String, String> extraHeaders
+    ) {
+        java.util.concurrent.atomic.AtomicBoolean released = new java.util.concurrent.atomic.AtomicBoolean();
+        Runnable releaseOnce = () -> {
+            if (released.compareAndSet(false, true)) {
+                writeBackpressure.release();
+            }
+        };
+        try {
+            forward(context, targetNodeId, targetHost, targetPort, extraHeaders);
+        } catch (Exception e) {
+            releaseOnce.run();
+            throw e;
+        }
+        // forward() dispatches asynchronously via the HttpClient; arrange for the slot to be
+        // released once the response (or error) is written back to the client.
+        context.response().endHandler(ignored -> releaseOnce.run());
+        context.response().closeHandler(ignored -> releaseOnce.run());
+        if (context.response().ended()) {
+            releaseOnce.run();
+        }
     }
 
     private void forward(
@@ -2288,6 +2349,69 @@ public class HttpApiServer implements AutoCloseable {
     private record SnapshotPin(String indexName, String pinId) {
     }
 
+    /**
+     * Caches per-shard remote-snapshot readiness (the boolean "no pending uploads" flag) so that
+     * search planning does not issue an etcd listAll call for every shard on every request. The
+     * flag only ever flips from false to true, so a cached true stays valid; a cached false is
+     * re-checked on cache refresh. The snapshot generation is intentionally NOT cached — it is
+     * fetched live so a weak read immediately after a write sees the freshest snapshot.
+     */
+    private final class SnapshotReadinessCache {
+        private final ConcurrentHashMap<ShardId, Boolean> cache = new ConcurrentHashMap<>();
+
+        boolean getOrLoad(ShardId shardId) {
+            Boolean cached = cache.get(shardId);
+            if (cached != null) {
+                return cached;
+            }
+            return load(shardId);
+        }
+
+        private boolean load(ShardId shardId) {
+            try {
+                String physicalIndexName = physicalIndexName(shardId);
+                IndexCommitSnapshot snapshot = manifestMetadataManager.latestSnapshot(physicalIndexName);
+                if (snapshot == null) {
+                    cache.put(shardId, false);
+                    return false;
+                }
+                boolean ready = manifestMetadataManager.listAll(physicalIndexName, List.of(
+                                IndexFileStatus.DIRTY,
+                                IndexFileStatus.UPLOADING,
+                                IndexFileStatus.CLEAN,
+                                IndexFileStatus.PINNED
+                        ))
+                        .stream()
+                        .noneMatch(metadata -> metadata.getStatus() == IndexFileStatus.DIRTY
+                                || metadata.getStatus() == IndexFileStatus.UPLOADING);
+                // Only cache the positive result; a negative result may flip to true on the next
+                // commit, so leave it uncached to be re-checked on the next refresh.
+                if (ready) {
+                    cache.put(shardId, true);
+                }
+                return ready;
+            } catch (Exception e) {
+                log.debug("failed to load remote snapshot readiness for {}", shardId.routeKey(), e);
+                return false;
+            }
+        }
+
+        void refresh(ClusterState state) {
+            if (state.routingTable().isEmpty()) {
+                cache.clear();
+                return;
+            }
+            Set<ShardId> live = new HashSet<>();
+            for (ShardRouting routing : state.routingTable()) {
+                live.add(routing.shardId());
+            }
+            cache.keySet().retainAll(live);
+            for (ShardId shardId : live) {
+                load(shardId);
+            }
+        }
+    }
+
     private interface MeasuredSupplier<T> {
         T get() throws Exception;
     }
@@ -2300,12 +2424,20 @@ public class HttpApiServer implements AutoCloseable {
         if (writeMaintenanceTimerId != null) {
             vertx.cancelTimer(writeMaintenanceTimerId);
         }
+        // Stop accepting new requests and drain in-flight HTTP requests before tearing down the
+        // services they depend on. Closing Vertx waits for its worker pools to drain, which
+        // guarantees no blocking handler is still touching localShardIndexService when we close it.
         if (httpServer != null) {
             try {
                 httpServer.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
             } catch (Exception e) {
                 log.warn("failed to close http server", e);
             }
+        }
+        try {
+            vertx.close().toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("failed to close vertx", e);
         }
         shutdownMaintenanceExecutor();
         try {
@@ -2314,16 +2446,18 @@ public class HttpApiServer implements AutoCloseable {
             log.warn("failed to close local shard index service", e);
         }
         clusterCoordinator.close();
-        try {
-            vertx.close().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            log.warn("failed to close vertx", e);
-        }
         if (etcdClient != null) {
             etcdClient.close();
         }
         if (s3Client != null) {
             s3Client.close();
+        }
+        if (forwardingClient instanceof AutoCloseable closeable) {
+            try {
+                closeable.close();
+            } catch (Exception e) {
+                log.warn("failed to close forwarding http client", e);
+            }
         }
         serverMetrics.close();
     }

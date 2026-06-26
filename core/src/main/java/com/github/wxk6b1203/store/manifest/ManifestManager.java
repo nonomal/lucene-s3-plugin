@@ -39,7 +39,8 @@ import java.util.concurrent.TimeoutException;
 
 @Slf4j
 public class ManifestManager implements AutoCloseable {
-    private static final Set<UploadKey> IN_FLIGHT_UPLOADS = ConcurrentHashMap.newKeySet();
+    private static final long IN_FLIGHT_POLL_INTERVAL_MILLIS = 20L;
+    private static final ConcurrentHashMap<UploadKey, CompletableFuture<Void>> IN_FLIGHT_UPLOADS = new ConcurrentHashMap<>();
 
     private final ManifestOptions options;
     private final RemoteObjectStore remoteObjectStore;
@@ -353,28 +354,48 @@ public class ManifestManager implements AutoCloseable {
             log.error("Failed to upload index file {}/{}", metadata.getIndexName(), metadata.getName(), e);
             return false;
         } finally {
-            IN_FLIGHT_UPLOADS.remove(uploadKey);
+            releaseUploadSlot(uploadKey);
         }
     }
 
     private boolean acquireUploadSlot(UploadKey uploadKey, IndexFileMetadata metadata) {
         long deadlineNanos = System.nanoTime() + options.uploadWaitTimeout().toNanos();
-        while (!IN_FLIGHT_UPLOADS.add(uploadKey)) {
+        while (true) {
+            CompletableFuture<Void> created = new CompletableFuture<>();
+            CompletableFuture<Void> existing = IN_FLIGHT_UPLOADS.putIfAbsent(uploadKey, created);
+            if (existing == null) {
+                return true;
+            }
+            // Another upload for the same content is in flight; wait for it to finish rather than
+            // hammering the metadata store. Re-check metadata occasionally so we don't wait the
+            // full timeout if the in-flight upload already succeeded but the slot wasn't cleared.
             IndexFileMetadata current = metadataManager.fileMetadata(metadata.getIndexName(), metadata.getName());
             if (sameMetadataIdentity(metadata, current) && remoteReadable(current.getStatus())) {
                 return false;
             }
-            if (System.nanoTime() >= deadlineNanos) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
                 return false;
             }
             try {
-                TimeUnit.MILLISECONDS.sleep(20);
+                existing.get(Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(IN_FLIGHT_POLL_INTERVAL_MILLIS)),
+                        TimeUnit.NANOSECONDS);
+            } catch (TimeoutException ignored) {
+                // Poll again: re-check metadata and re-attempt slot acquisition.
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;
+            } catch (ExecutionException ignored) {
+                // The in-flight upload failed; loop to acquire the slot ourselves.
             }
         }
-        return true;
+    }
+
+    private void releaseUploadSlot(UploadKey uploadKey) {
+        CompletableFuture<Void> pending = IN_FLIGHT_UPLOADS.remove(uploadKey);
+        if (pending != null) {
+            pending.complete(null);
+        }
     }
 
     private boolean sameMetadataIdentity(IndexFileMetadata expected, IndexFileMetadata current) {

@@ -869,6 +869,11 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                 }
             }
         }
+        for (ShardId shardId : List.copyOf(mappingsByShard.keySet())) {
+            if (shardId.indexName().equals(indexName)) {
+                mappingsByShard.remove(shardId);
+            }
+        }
         for (int shard = 0; shard < numberOfShards; shard++) {
             closeRemoteSearchers(new ShardId(indexName, shard));
             String physicalIndexName = indexName + "__shard_" + shard;
@@ -1212,13 +1217,22 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         synchronized (shardWriter) {
             int latestSequence = shardWriter.nextSnapshotSequence.get();
             int cleanPublishedSequence = shardWriter.cleanPublishedSnapshotSequence.get();
+            long nowNanos = System.nanoTime();
             boolean released = false;
             for (Iterator<RetainedSnapshotCommit> iterator = shardWriter.retainedSnapshotCommits.iterator(); iterator.hasNext(); ) {
                 RetainedSnapshotCommit retained = iterator.next();
                 if (!retained.completed) {
-                    continue;
+                    // The async publish future never completed (e.g. upload worker stalled or the
+                    // process recovered after a crash). Force-release so the IndexCommit snapshot
+                    // and its segment files do not leak forever.
+                    if (retained.publishTimedOut(nowNanos)) {
+                        log.warn("force-releasing timed-out snapshot publish for shard {} sequence {}",
+                                shardWriter.shardId.routeKey(), retained.sequence);
+                    } else {
+                        continue;
+                    }
                 }
-                if (retained.sequence >= latestSequence && retained.sequence > cleanPublishedSequence) {
+                if (retained.completed && retained.sequence >= latestSequence && retained.sequence > cleanPublishedSequence) {
                     continue;
                 }
                 try {
@@ -2585,13 +2599,20 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
     }
 
     private static final class RetainedSnapshotCommit {
+        private static final long MAX_PUBLISH_NANOS = TimeUnit.MINUTES.toNanos(2);
+
         private final IndexCommit commit;
         private final int sequence;
+        private final long createdAtNanos = System.nanoTime();
         private boolean completed;
 
         private RetainedSnapshotCommit(IndexCommit commit, int sequence) {
             this.commit = commit;
             this.sequence = sequence;
+        }
+
+        private boolean publishTimedOut(long nowNanos) {
+            return !completed && (nowNanos - createdAtNanos) >= MAX_PUBLISH_NANOS;
         }
     }
 

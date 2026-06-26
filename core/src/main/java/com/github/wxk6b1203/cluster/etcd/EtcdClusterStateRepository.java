@@ -190,7 +190,8 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
     }
 
     private IOException ioException(String message, Exception cause) {
-        IOException exception = new IOException(message + ": " + cause.getMessage());
+        String causeMessage = cause.getMessage();
+        IOException exception = new IOException(causeMessage == null ? message : message + ": " + causeMessage);
         exception.initCause(cause);
         return exception;
     }

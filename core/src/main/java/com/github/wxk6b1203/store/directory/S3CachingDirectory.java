@@ -382,21 +382,26 @@ public class S3CachingDirectory extends BaseDirectory {
     private void cacheRemoteFile(String name) throws IOException {
         Object lock = cacheLocks.computeIfAbsent(name, ignored -> new Object());
         synchronized (lock) {
-            if (localFileAvailable(name)) {
-                return;
-            }
-            RemoteCacheStats.miss();
-            IndexFileMetadata metadata = readableRemoteFileMetadata(name);
-            Path temp = sharedTempPath.resolve(name + "." + Thread.currentThread().threadId() + ".tmp");
             try {
-                manifestManager.download(metadata, temp);
-                RemoteCacheStats.download();
                 if (localFileAvailable(name)) {
                     return;
                 }
-                moveIntoCache(temp, sharedDataPath.resolve(name), metadata);
+                RemoteCacheStats.miss();
+                IndexFileMetadata metadata = readableRemoteFileMetadata(name);
+                Path temp = sharedTempPath.resolve(name + "." + Thread.currentThread().threadId() + ".tmp");
+                try {
+                    manifestManager.download(metadata, temp);
+                    RemoteCacheStats.download();
+                    if (localFileAvailable(name)) {
+                        return;
+                    }
+                    moveIntoCache(temp, sharedDataPath.resolve(name), metadata);
+                } finally {
+                    Files.deleteIfExists(temp);
+                }
             } finally {
-                Files.deleteIfExists(temp);
+                // Best-effort cleanup: only remove the lock if no other thread is waiting on it.
+                cacheLocks.remove(name, lock);
             }
         }
     }

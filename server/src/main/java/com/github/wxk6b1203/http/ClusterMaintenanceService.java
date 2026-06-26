@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 final class ClusterMaintenanceService {
@@ -391,6 +392,7 @@ final class ClusterMaintenanceService {
     }
 
     private void runWarmLifecyclePolicies(ClusterState state, Instant now) {
+        forgetStaleForceMergeCompletions(state);
         state.routingTable().stream()
                 .filter(routing -> routing.state() == ShardState.STARTED)
                 .filter(routing -> localNode.id().equals(routing.nodeId()))
@@ -496,6 +498,24 @@ final class ClusterMaintenanceService {
             return null;
         }
         return state.lifecyclePolicies().get(policyName);
+    }
+
+    private void forgetStaleForceMergeCompletions(ClusterState state) {
+        if (lifecycleForceMergesCompleted.isEmpty()) {
+            return;
+        }
+        Set<String> ownedKeys = new HashSet<>();
+        for (ShardRouting routing : state.routingTable()) {
+            if (!localNode.id().equals(routing.nodeId()) || routing.state() != ShardState.STARTED) {
+                continue;
+            }
+            if (state.indices().get(routing.shardId().indexName()) == null) {
+                continue;
+            }
+            ownedKeys.add(routing.shardId().routeKey()
+                    + "/" + routing.ownerTerm() + "/" + routing.allocationEpoch());
+        }
+        lifecycleForceMergesCompleted.retainAll(ownedKeys);
     }
 
     private void runLocalCacheCleanup() {

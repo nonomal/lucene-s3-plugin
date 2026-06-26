@@ -25,23 +25,39 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     private static final int MAX_CAS_RETRIES = 32;
 
     private final Client client;
     private final String namespace;
+    private final long operationTimeoutSeconds;
 
     @Data
     @Builder
     public static class Options {
         @Builder.Default
         private String namespace = "lucene-s3/cluster/manifest";
+        @Builder.Default
+        private long operationTimeoutSeconds = 10;
     }
 
     public EtcdManifestMetadataManager(Options options, Client client) {
         this.client = Objects.requireNonNull(client, "client");
         this.namespace = normalize(options == null ? null : options.namespace);
+        this.operationTimeoutSeconds = Math.max(1, options == null ? 10 : options.operationTimeoutSeconds);
+    }
+
+    private <T> T await(java.util.concurrent.CompletableFuture<T> future) throws Exception {
+        try {
+            return future.get(operationTimeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw e;
+        }
     }
 
     @Override
@@ -102,9 +118,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public List<IndexFileMetadata> listAll(String indexName, List<IndexFileStatus> status) {
         try {
-            var response = client.getKVClient()
-                    .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build())
-                    .get();
+            var response = await(client.getKVClient()
+                    .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build()));
             List<IndexFileMetadata> result = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
                 IndexFileMetadata metadata = decodeFileMetadata(item);
@@ -144,12 +159,11 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         System.currentTimeMillis()
                 );
                 ByteSequence key = snapshotKey(indexName, generation);
-                boolean created = client.getKVClient()
+                boolean created = await(client.getKVClient()
                         .txn()
                         .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0)))
                         .Then(Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(snapshot)), PutOption.DEFAULT))
-                        .commit()
-                        .get()
+                        .commit())
                         .isSucceeded();
                 if (created) {
                     return generation;
@@ -171,7 +185,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public IndexCommitSnapshot snapshot(String indexName, long generation) {
         try {
-            var response = client.getKVClient().get(snapshotKey(indexName, generation)).get();
+            var response = await(client.getKVClient().get(snapshotKey(indexName, generation)));
             return response.getKvs().isEmpty() ? null : decodeSnapshot(response.getKvs().getFirst());
         } catch (Exception e) {
             throw storageException("Failed to get commit snapshot: " + indexName + "/" + generation, e);
@@ -181,9 +195,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public List<IndexCommitSnapshot> listSnapshots(String indexName) {
         try {
-            var response = client.getKVClient()
-                    .get(snapshotPrefix(indexName), GetOption.builder().isPrefix(true).build())
-                    .get();
+            var response = await(client.getKVClient()
+                    .get(snapshotPrefix(indexName), GetOption.builder().isPrefix(true).build()));
             List<IndexCommitSnapshot> result = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
                 result.add(decodeSnapshot(item));
@@ -199,7 +212,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void deleteSnapshot(String indexName, long generation) {
         try {
-            client.getKVClient().delete(snapshotKey(indexName, generation)).get();
+            await(client.getKVClient().delete(snapshotKey(indexName, generation)));
         } catch (Exception e) {
             throw storageException("Failed to delete commit snapshot: " + indexName + "/" + generation, e);
         }
@@ -209,9 +222,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     public void pinSnapshot(String indexName, long generation, String pinId, long expiresAtMillis) {
         try {
             IndexCommitSnapshotPin pin = new IndexCommitSnapshotPin(indexName, generation, pinId, expiresAtMillis);
-            client.getKVClient()
-                    .put(pinKey(indexName, pinId), ByteSequence.from(JsonUtil.writeValueAsBytes(pin)))
-                    .get();
+            await(client.getKVClient()
+                    .put(pinKey(indexName, pinId), ByteSequence.from(JsonUtil.writeValueAsBytes(pin))));
         } catch (Exception e) {
             throw storageException("Failed to pin commit snapshot: " + indexName + "/" + generation, e);
         }
@@ -220,7 +232,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void releaseSnapshotPin(String indexName, String pinId) {
         try {
-            client.getKVClient().delete(pinKey(indexName, pinId)).get();
+            await(client.getKVClient().delete(pinKey(indexName, pinId)));
         } catch (Exception e) {
             throw storageException("Failed to release commit snapshot pin: " + indexName + "/" + pinId, e);
         }
@@ -229,9 +241,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public List<IndexCommitSnapshotPin> snapshotPins(String indexName) {
         try {
-            var response = client.getKVClient()
-                    .get(pinPrefix(indexName), GetOption.builder().isPrefix(true).build())
-                    .get();
+            var response = await(client.getKVClient()
+                    .get(pinPrefix(indexName), GetOption.builder().isPrefix(true).build()));
             List<IndexCommitSnapshotPin> result = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
                 result.add(decodeSnapshotPin(item));
@@ -245,9 +256,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void deleteExpiredSnapshotPins(long nowMillis) {
         try {
-            var response = client.getKVClient()
-                    .get(key("snapshot_pin/"), GetOption.builder().isPrefix(true).build())
-                    .get();
+            var response = await(client.getKVClient()
+                    .get(key("snapshot_pin/"), GetOption.builder().isPrefix(true).build()));
             for (KeyValue item : response.getKvs()) {
                 IndexCommitSnapshotPin pin = decodeSnapshotPin(item);
                 if (pin.getExpiresAtMillis() <= nowMillis) {
@@ -262,9 +272,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void deleteByStatus(String indexName, List<IndexFileStatus> statuses) {
         try {
-            var response = client.getKVClient()
-                    .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build())
-                    .get();
+            var response = await(client.getKVClient()
+                    .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build()));
             for (KeyValue item : response.getKvs()) {
                 IndexFileMetadata metadata = decodeFileMetadata(item);
                 if (statuses.contains(metadata.getStatus())) {
@@ -279,22 +288,19 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void deleteAll(String indexName) {
         try {
-            client.getKVClient()
-                    .delete(filePrefix(indexName), DeleteOption.builder().isPrefix(true).build())
-                    .get();
-            client.getKVClient()
-                    .delete(snapshotPrefix(indexName), DeleteOption.builder().isPrefix(true).build())
-                    .get();
-            client.getKVClient()
-                    .delete(pinPrefix(indexName), DeleteOption.builder().isPrefix(true).build())
-                    .get();
+            await(client.getKVClient()
+                    .delete(filePrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
+            await(client.getKVClient()
+                    .delete(snapshotPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
+            await(client.getKVClient()
+                    .delete(pinPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
         } catch (Exception e) {
             throw storageException("Failed to delete file metadata: " + indexName, e);
         }
     }
 
     private KeyValue fileKv(ByteSequence key) throws Exception {
-        var response = client.getKVClient().get(key).get();
+        var response = await(client.getKVClient().get(key));
         return response.getKvs().isEmpty() ? null : response.getKvs().getFirst();
     }
 
@@ -302,23 +308,21 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         Cmp cmp = currentKv == null
                 ? new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
                 : new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(currentKv.getModRevision()));
-        return client.getKVClient()
+        return await(client.getKVClient()
                 .txn()
                 .If(cmp)
                 .Then(Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(metadata)), PutOption.DEFAULT))
-                .commit()
-                .get()
+                .commit())
                 .isSucceeded();
     }
 
     private boolean deleteIfCurrent(KeyValue currentKv) throws Exception {
         Cmp cmp = new Cmp(currentKv.getKey(), Cmp.Op.EQUAL, CmpTarget.modRevision(currentKv.getModRevision()));
-        return client.getKVClient()
+        return await(client.getKVClient()
                 .txn()
                 .If(cmp)
                 .Then(Op.delete(currentKv.getKey(), DeleteOption.DEFAULT))
-                .commit()
-                .get()
+                .commit())
                 .isSucceeded();
     }
 
@@ -388,7 +392,10 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     }
 
     private StorageException storageException(String message, Exception cause) {
-        StorageException exception = new StorageException(message + ": " + cause.getMessage());
+        String causeMessage = cause.getMessage();
+        StorageException exception = new StorageException(
+                causeMessage == null ? message : message + ": " + causeMessage
+        );
         exception.initCause(cause);
         return exception;
     }
