@@ -2210,14 +2210,17 @@ public class HttpApiServer implements AutoCloseable {
                 writeBackpressure.release();
             }
         };
+        // forward() dispatches asynchronously via the HttpClient. On a synchronous throw the
+        // caller's finally block releases the slot (its `released` flag stays false), so we must
+        // NOT release here too — that would double-release and permanently inflate the semaphore.
         try {
             forward(context, targetNodeId, targetHost, targetPort, extraHeaders);
         } catch (Exception e) {
-            releaseOnce.run();
             throw e;
         }
-        // forward() dispatches asynchronously via the HttpClient; arrange for the slot to be
-        // released once the response (or error) is written back to the client.
+        // forward() returned normally; arrange for the slot to be released once the response
+        // (or error) is written back to the client. The caller sets its `released` flag after we
+        // return, so its finally block will not release.
         context.response().endHandler(ignored -> releaseOnce.run());
         context.response().closeHandler(ignored -> releaseOnce.run());
         if (context.response().ended()) {
@@ -2352,9 +2355,11 @@ public class HttpApiServer implements AutoCloseable {
     /**
      * Caches per-shard remote-snapshot readiness (the boolean "no pending uploads" flag) so that
      * search planning does not issue an etcd listAll call for every shard on every request. The
-     * flag only ever flips from false to true, so a cached true stays valid; a cached false is
-     * re-checked on cache refresh. The snapshot generation is intentionally NOT cached — it is
-     * fetched live so a weak read immediately after a write sees the freshest snapshot.
+     * flag is NOT monotonic — a fresh write flips it true -> false while files are DIRTY/UPLOADING —
+     * so both outcomes are cached and re-evaluated on each refresh tick (the period bounds staleness).
+     * Caching false during the upload window keeps weak reads routed to the shard owner, preserving
+     * read-your-writes. The snapshot generation is intentionally NOT cached — it is fetched live so a
+     * weak read immediately after a write sees the freshest published snapshot.
      */
     private final class SnapshotReadinessCache {
         private final ConcurrentHashMap<ShardId, Boolean> cache = new ConcurrentHashMap<>();
@@ -2384,11 +2389,12 @@ public class HttpApiServer implements AutoCloseable {
                         .stream()
                         .noneMatch(metadata -> metadata.getStatus() == IndexFileStatus.DIRTY
                                 || metadata.getStatus() == IndexFileStatus.UPLOADING);
-                // Only cache the positive result; a negative result may flip to true on the next
-                // commit, so leave it uncached to be re-checked on the next refresh.
-                if (ready) {
-                    cache.put(shardId, true);
-                }
+                // Cache both outcomes. Readiness is NOT monotonic: a fresh write flips it
+                // true -> false (files become DIRTY/UPLOADING), so a cached true must be
+                // overwritable. Caching false is what preserves read-your-writes for weak reads
+                // during the async upload window — they route to the shard owner instead of a
+                // stale remote generation. Stale values are bounded by the refresh tick.
+                cache.put(shardId, ready);
                 return ready;
             } catch (Exception e) {
                 log.debug("failed to load remote snapshot readiness for {}", shardId.routeKey(), e);
