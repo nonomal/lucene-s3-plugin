@@ -97,6 +97,9 @@ public class HttpApiServer implements AutoCloseable {
     private final SnapshotReadinessCache snapshotReadinessCache = new SnapshotReadinessCache();
     private volatile long lastMetricsRefreshNanos;
     private static final long METRICS_REFRESH_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final long CLUSTER_STATE_CACHE_TTL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private volatile ClusterState cachedClusterState;
+    private volatile long cachedClusterStateExpiresAtNanos;
     private Long maintenanceTimerId;
     private Long writeMaintenanceTimerId;
     private S3Client s3Client;
@@ -1137,7 +1140,7 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private ClusterState writableClusterState(RoutingContext context) throws IOException {
-        ClusterState state = clusterStateRepository.current();
+        ClusterState state = currentClusterState();
         log.debug("writable state node={} version={} master={} hasUnavailable={}",
                 localNode.id(), state.version(), state.masterNodeId(), hasUnavailableShardOwner(state));
         if (!hasUnavailableShardOwner(state)) {
@@ -1151,6 +1154,27 @@ public class HttpApiServer implements AutoCloseable {
             return null;
         }
         throw new NotMasterException("stale shard owner routing must be rerouted by the current master node");
+    }
+
+    /**
+     * Returns the cluster state for routing/read decisions, served from a short-TTL cache to avoid
+     * an etcd round-trip on every request. Stale routing fails safe: a forwarded request lands on
+     * a dead/non-owner node, the forward fails, and the client retries after the cache expires.
+     * <p>
+     * <b>Never use this for write-fence validation</b> — {@link #validateShardWriteFence} must read
+     * live state to detect ownership changes since the route was computed (TOCTOU). Using cached
+     * state there would make the fence a no-op.
+     */
+    private ClusterState currentClusterState() throws IOException {
+        ClusterState cached = cachedClusterState;
+        long now = System.nanoTime();
+        if (cached != null && now < cachedClusterStateExpiresAtNanos) {
+            return cached;
+        }
+        ClusterState fresh = clusterStateRepository.current();
+        cachedClusterState = fresh;
+        cachedClusterStateExpiresAtNanos = now + CLUSTER_STATE_CACHE_TTL_NANOS;
+        return fresh;
     }
 
     private boolean hasUnavailableShardOwner(ClusterState state) {
@@ -1348,6 +1372,9 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private void validateShardWriteFence(ShardId shardId, long ownerTerm, long allocationEpoch) throws IOException {
+        // MUST read live state — never cachedClusterState(). The fence detects ownership changes
+        // (ownerTerm/allocationEpoch) that happened since the route was computed; a cached read
+        // would make this check a no-op and allow split-brain writes.
         ShardRouting routing = routingFor(shardId, clusterStateRepository.current());
         if (routing.state() != ShardState.STARTED) {
             throw new IllegalStateException("shard is not writable: " + shardId.routeKey() + " state=" + routing.state());

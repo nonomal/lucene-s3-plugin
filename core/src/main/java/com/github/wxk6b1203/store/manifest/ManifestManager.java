@@ -118,6 +118,8 @@ public class ManifestManager implements AutoCloseable {
     ) throws IOException {
         List<CommitFile> commitFiles = new ArrayList<>();
         List<PendingUpload> pendingUploads = new ArrayList<>();
+        List<IndexFile> batch = new ArrayList<>();
+        List<Path> batchSources = new ArrayList<>();
         String snapshotIndexName = null;
         for (CommittingIndexFile indexFile : indexFiles) {
             if (snapshotIndexName == null) {
@@ -140,16 +142,19 @@ public class ManifestManager implements AutoCloseable {
                     checksum,
                     modifiedTime
             );
-            IndexFileMetadata metadata = uploadMetadata(file);
+            batch.add(file);
+            batchSources.add(uploadSource);
+        }
+        List<IndexFileMetadata> metadatas = batch.isEmpty()
+                ? List.of()
+                : metadataManager.commitFiles(batch);
+        for (int i = 0; i < batch.size(); i++) {
+            IndexFile file = batch.get(i);
+            IndexFileMetadata metadata = metadatas.get(i);
             if (metadata != null) {
-                pendingUploads.add(new PendingUpload(uploadSource, metadata));
+                pendingUploads.add(new PendingUpload(batchSources.get(i), metadata));
             }
-            IndexFileMetadata current = metadata == null
-                    ? metadataManager.fileMetadata(file.indexName(), file.name())
-                    : metadata;
-            if (current != null) {
-                commitFiles.add(new CommitFile(current.getIndexName(), current.getName()));
-            }
+            commitFiles.add(new CommitFile(file.indexName(), file.name()));
         }
         SnapshotCommit snapshotCommit = snapshotCommit(snapshotIndexName, snapshotFileNames, commitFiles);
         if (!pendingUploads.isEmpty()) {
@@ -268,31 +273,6 @@ public class ManifestManager implements AutoCloseable {
         for (IndexCommitSnapshot snapshot : deleteCandidates) {
             metadataManager.deleteSnapshot(indexName, snapshot.getGeneration());
         }
-    }
-
-    private IndexFileMetadata uploadMetadata(IndexFile file) {
-        IndexFileMetadata existing = metadataManager.fileMetadata(file.indexName(), file.name());
-        if (existing != null) {
-            if (existing.getStatus() == IndexFileStatus.CLEAN || existing.getStatus() == IndexFileStatus.PINNED) {
-                return null;
-            }
-            if (sameUpload(existing, file)) {
-                return existing;
-            }
-        }
-        int epoch = metadataManager.commitFile(file);
-        IndexFileMetadata metadata = metadataManager.fileMetadata(file.indexName(), file.name());
-        if (metadata == null || metadata.getEpoch() != epoch) {
-            throw new IllegalStateException("failed to store file metadata: " + file.indexName() + "/" + file.name());
-        }
-        return metadata;
-    }
-
-    private boolean sameUpload(IndexFileMetadata metadata, IndexFile file) {
-        return metadata.getSize() == file.size()
-                && metadata.getChecksum() == file.checksum()
-                && metadata.getModifiedTime() == file.modifiedTime()
-                && Objects.equals(metadata.getObjectKey(), file.objectKey());
     }
 
     private boolean uploadCommit(List<PendingUpload> pendingUploads, SnapshotCommit snapshotCommit) {
@@ -434,10 +414,17 @@ public class ManifestManager implements AutoCloseable {
         if (snapshotCommit.indexName() == null || snapshotCommit.fileNames().isEmpty()) {
             return true;
         }
-        Map<String, IndexFileMetadata> files = new HashMap<>();
         String indexName = snapshotCommit.indexName();
+        // One range get for all files in the shard instead of a point get per snapshot file. This
+        // must be a fresh read (not the commit-time pre-read) because async uploads flip statuses
+        // between commit and publish.
+        Map<String, IndexFileMetadata> allFiles = new HashMap<>();
+        for (IndexFileMetadata metadata : metadataManager.listAll(indexName, allFileStatuses())) {
+            allFiles.put(metadata.getName(), metadata);
+        }
+        Map<String, IndexFileMetadata> files = new HashMap<>();
         for (String fileName : snapshotCommit.fileNames()) {
-            IndexFileMetadata metadata = metadataManager.fileMetadata(indexName, fileName);
+            IndexFileMetadata metadata = allFiles.get(fileName);
             if (metadata == null || !remoteReadable(metadata.getStatus())) {
                 return false;
             }

@@ -23,7 +23,9 @@ import lombok.Data;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -61,7 +63,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     }
 
     @Override
-    public int commitFile(IndexFile file) {
+    public IndexFileMetadata commitFile(IndexFile file) {
         ByteSequence key = fileKey(file.indexName(), file.name());
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
@@ -80,7 +82,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         IndexFileStatus.DIRTY
                 );
                 if (putIfCurrent(key, currentKv, metadata)) {
-                    return Math.toIntExact(epoch);
+                    return metadata;
                 }
             } catch (Exception e) {
                 throw storageException("Failed to commit file metadata: " + file.indexName() + "/" + file.name(), e);
@@ -88,6 +90,99 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
         throw new StorageException("Failed to commit file metadata after CAS retries: "
                 + file.indexName() + "/" + file.name());
+    }
+
+    @Override
+    public List<IndexFileMetadata> commitFiles(List<IndexFile> files) {
+        if (files.isEmpty()) {
+            return List.of();
+        }
+        String indexName = files.getFirst().indexName();
+        for (IndexFile file : files) {
+            if (!indexName.equals(file.indexName())) {
+                throw new IllegalArgumentException("commitFiles must target a single physical index");
+            }
+        }
+        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+            try {
+                Map<String, KeyValue> current = fileKvByPrefix(indexName);
+                List<IndexFileMetadata> result = new ArrayList<>(files.size());
+                List<BatchCommitEntry> toCommit = new ArrayList<>();
+                for (IndexFile file : files) {
+                    KeyValue currentKv = current.get(file.name());
+                    IndexFileMetadata existing = currentKv == null ? null : decodeFileMetadata(currentKv);
+                    if (existing != null) {
+                        if (existing.getStatus() == IndexFileStatus.CLEAN
+                                || existing.getStatus() == IndexFileStatus.PINNED) {
+                            result.add(null);
+                            continue;
+                        }
+                        if (sameUpload(existing, file)) {
+                            result.add(existing);
+                            continue;
+                        }
+                    }
+                    long epoch = existing == null ? 1 : existing.getEpoch() + 1;
+                    IndexFileMetadata metadata = new IndexFileMetadata(
+                            file.indexName(),
+                            file.name(),
+                            file.dataDirectory(),
+                            file.objectKey(),
+                            epoch,
+                            file.size(),
+                            file.checksum(),
+                            file.modifiedTime(),
+                            IndexFileStatus.DIRTY
+                    );
+                    toCommit.add(new BatchCommitEntry(file, currentKv, metadata));
+                    result.add(metadata);
+                }
+                if (toCommit.isEmpty()) {
+                    return result;
+                }
+                if (putAllIfCurrent(toCommit)) {
+                    return result;
+                }
+                // CAS failed: re-read and retry.
+            } catch (Exception e) {
+                throw storageException("Failed to commit file metadata batch: " + indexName, e);
+            }
+        }
+        throw new StorageException("Failed to commit file metadata batch after CAS retries: " + indexName);
+    }
+
+    private Map<String, KeyValue> fileKvByPrefix(String indexName) throws Exception {
+        var response = await(client.getKVClient()
+                .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build()));
+        Map<String, KeyValue> map = new HashMap<>();
+        for (KeyValue kv : response.getKvs()) {
+            map.put(decodeFileMetadata(kv).getName(), kv);
+        }
+        return map;
+    }
+
+    private boolean putAllIfCurrent(List<BatchCommitEntry> entries) throws Exception {
+        Cmp[] cmps = new Cmp[entries.size()];
+        Op[] ops = new Op[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            BatchCommitEntry entry = entries.get(i);
+            ByteSequence key = fileKey(entry.file.indexName(), entry.file.name());
+            cmps[i] = entry.currentKv == null
+                    ? new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+                    : new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(entry.currentKv.getModRevision()));
+            ops[i] = Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(entry.metadata)), PutOption.DEFAULT);
+        }
+        return await(client.getKVClient().txn().If(cmps).Then(ops).commit()).isSucceeded();
+    }
+
+    private boolean sameUpload(IndexFileMetadata metadata, IndexFile file) {
+        return metadata.getSize() == file.size()
+                && metadata.getChecksum() == file.checksum()
+                && metadata.getModifiedTime() == file.modifiedTime()
+                && Objects.equals(metadata.getObjectKey(), file.objectKey());
+    }
+
+    private record BatchCommitEntry(IndexFile file, KeyValue currentKv, IndexFileMetadata metadata) {
     }
 
     @Override
@@ -147,10 +242,10 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     public long publishSnapshot(String indexName, String segmentFileName, List<IndexFileMetadata> files) {
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
-                long generation = listSnapshots(indexName).stream()
-                        .mapToLong(IndexCommitSnapshot::getGeneration)
-                        .max()
-                        .orElse(0) + 1;
+                // Snapshot keys are zero-padded (%020d), so lexicographic descending order equals
+                // numeric descending order; a limit-1 descending range get returns the highest
+                // generation without decoding every snapshot.
+                long generation = latestGeneration(indexName) + 1;
                 IndexCommitSnapshot snapshot = new IndexCommitSnapshot(
                         indexName,
                         generation,
@@ -177,9 +272,28 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
 
     @Override
     public IndexCommitSnapshot latestSnapshot(String indexName) {
-        return listSnapshots(indexName).stream()
-                .max(Comparator.comparingLong(IndexCommitSnapshot::getGeneration))
-                .orElse(null);
+        try {
+            KeyValue kv = latestSnapshotKv(indexName);
+            return kv == null ? null : decodeSnapshot(kv);
+        } catch (Exception e) {
+            throw storageException("Failed to get latest commit snapshot: " + indexName, e);
+        }
+    }
+
+    private long latestGeneration(String indexName) throws Exception {
+        KeyValue kv = latestSnapshotKv(indexName);
+        return kv == null ? 0 : decodeSnapshot(kv).getGeneration();
+    }
+
+    private KeyValue latestSnapshotKv(String indexName) throws Exception {
+        var response = await(client.getKVClient()
+                .get(snapshotPrefix(indexName), GetOption.builder()
+                        .isPrefix(true)
+                        .withLimit(1)
+                        .withSortOrder(GetOption.SortOrder.DESCEND)
+                        .withSortField(GetOption.SortTarget.KEY)
+                        .build()));
+        return response.getKvs().isEmpty() ? null : response.getKvs().getFirst();
     }
 
     @Override

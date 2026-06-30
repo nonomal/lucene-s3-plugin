@@ -573,7 +573,7 @@ public class LuceneLocalShardIndexServiceTest {
         ShardId shardId = new ShardId("books", 0);
         String physicalIndexName = "books__shard_0";
         metadata.commitFile(new IndexFile(physicalIndexName, "_1.si", 1, 7));
-        int segmentEpoch = metadata.commitFile(new IndexFile(physicalIndexName, "segments_2", 1, 9));
+        long segmentEpoch = metadata.commitFile(new IndexFile(physicalIndexName, "segments_2", 1, 9)).getEpoch();
         metadata.updateFileStatus(physicalIndexName, "segments_2", segmentEpoch, IndexFileStatus.UPLOADING);
 
         try (LuceneLocalShardIndexService service = new LuceneLocalShardIndexService(
