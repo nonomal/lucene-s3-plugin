@@ -11,6 +11,8 @@ import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
 import io.etcd.jetcd.Client;
 import io.etcd.jetcd.KeyValue;
+import io.etcd.jetcd.kv.GetResponse;
+import io.etcd.jetcd.kv.TxnResponse;
 import io.etcd.jetcd.op.Cmp;
 import io.etcd.jetcd.op.CmpTarget;
 import io.etcd.jetcd.op.Op;
@@ -22,6 +24,7 @@ import lombok.Data;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -105,7 +108,15 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
-                Map<String, KeyValue> current = fileKvByPrefix(indexName);
+                // Read only the files in this commit (one batched read-only txn) instead of a
+                // full prefix range get. CLEAN file metadata accumulates unbounded across the
+                // shard's lifetime (reclaimed only on whole-index delete), so a prefix read would
+                // decode the entire history on every write.
+                List<String> fileNames = new ArrayList<>(files.size());
+                for (IndexFile file : files) {
+                    fileNames.add(file.name());
+                }
+                Map<String, KeyValue> current = fileKvsByNames(indexName, fileNames);
                 List<IndexFileMetadata> result = new ArrayList<>(files.size());
                 List<BatchCommitEntry> toCommit = new ArrayList<>();
                 for (IndexFile file : files) {
@@ -151,14 +162,44 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         throw new StorageException("Failed to commit file metadata batch after CAS retries: " + indexName);
     }
 
-    private Map<String, KeyValue> fileKvByPrefix(String indexName) throws Exception {
-        var response = await(client.getKVClient()
-                .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build()));
-        Map<String, KeyValue> map = new HashMap<>();
-        for (KeyValue kv : response.getKvs()) {
-            map.put(decodeFileMetadata(kv).getName(), kv);
+    private Map<String, KeyValue> fileKvsByNames(String indexName, List<String> names) throws Exception {
+        if (names.isEmpty()) {
+            return Map.of();
+        }
+        // Read-only transaction (no If, only Op.get in Then) executes as a single linearizable
+        // snapshot read of the named keys in one round-trip; etcd supports read-only txns.
+        Op[] getOps = new Op[names.size()];
+        for (int i = 0; i < names.size(); i++) {
+            getOps[i] = Op.get(fileKey(indexName, names.get(i)), GetOption.DEFAULT);
+        }
+        TxnResponse txnResponse = await(client.getKVClient().txn().Then(getOps).commit());
+        List<GetResponse> getResponses = txnResponse.getGetResponses();
+        Map<String, KeyValue> map = new HashMap<>(names.size());
+        for (int i = 0; i < names.size(); i++) {
+            List<KeyValue> kvs = getResponses.get(i).getKvs();
+            if (!kvs.isEmpty()) {
+                map.put(names.get(i), kvs.getFirst());
+            }
         }
         return map;
+    }
+
+    @Override
+    public Map<String, IndexFileMetadata> filesByName(String indexName, Collection<String> names) {
+        if (names.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            List<String> ordered = new ArrayList<>(names);
+            Map<String, KeyValue> kvs = fileKvsByNames(indexName, ordered);
+            Map<String, IndexFileMetadata> result = new HashMap<>(kvs.size());
+            for (Map.Entry<String, KeyValue> entry : kvs.entrySet()) {
+                result.put(entry.getKey(), decodeFileMetadata(entry.getValue()));
+            }
+            return result;
+        } catch (Exception e) {
+            throw storageException("Failed to batch-read file metadata: " + indexName, e);
+        }
     }
 
     private boolean putAllIfCurrent(List<BatchCommitEntry> entries) throws Exception {

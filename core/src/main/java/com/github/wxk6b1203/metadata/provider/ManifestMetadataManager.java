@@ -7,7 +7,10 @@ import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public abstract class ManifestMetadataManager {
     public abstract IndexFileMetadata commitFile(IndexFile file);
@@ -55,6 +58,24 @@ public abstract class ManifestMetadataManager {
     public abstract List<IndexFileMetadata> listAll(String indexName, List<IndexFileStatus> status);
 
     public abstract IndexFileMetadata fileMetadata(String indexName, String name);
+
+    /**
+     * Read metadata for a specific set of file names in one logical call. Default implementation
+     * loops {@link #fileMetadata}; etcd-backed implementations override with a single read-only
+     * transaction so callers avoid a full prefix range read when they only need a known set of
+     * files. CLEAN file metadata accumulates unbounded across a shard's lifetime (reclaimed only
+     * on whole-index delete), so a prefix read would decode the entire history on every call.
+     */
+    public Map<String, IndexFileMetadata> filesByName(String indexName, Collection<String> names) {
+        Map<String, IndexFileMetadata> result = new HashMap<>(names.size());
+        for (String name : names) {
+            IndexFileMetadata metadata = fileMetadata(indexName, name);
+            if (metadata != null) {
+                result.put(name, metadata);
+            }
+        }
+        return result;
+    }
 
     public abstract long publishSnapshot(String indexName, String segmentFileName, List<IndexFileMetadata> files);
 

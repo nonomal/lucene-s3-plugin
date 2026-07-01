@@ -415,13 +415,12 @@ public class ManifestManager implements AutoCloseable {
             return true;
         }
         String indexName = snapshotCommit.indexName();
-        // One range get for all files in the shard instead of a point get per snapshot file. This
-        // must be a fresh read (not the commit-time pre-read) because async uploads flip statuses
-        // between commit and publish.
-        Map<String, IndexFileMetadata> allFiles = new HashMap<>();
-        for (IndexFileMetadata metadata : metadataManager.listAll(indexName, allFileStatuses())) {
-            allFiles.put(metadata.getName(), metadata);
-        }
+        // Read only the files in this snapshot (one batched read), not every file the shard has
+        // ever committed. This must be a fresh read (not the commit-time pre-read) because async
+        // uploads flip statuses between commit and publish. CLEAN file metadata accumulates here
+        // over time (reclaimed only on whole-index delete), so a full prefix read would decode
+        // unbounded history on every publish.
+        Map<String, IndexFileMetadata> allFiles = metadataManager.filesByName(indexName, snapshotCommit.fileNames());
         Map<String, IndexFileMetadata> files = new HashMap<>();
         for (String fileName : snapshotCommit.fileNames()) {
             IndexFileMetadata metadata = allFiles.get(fileName);
