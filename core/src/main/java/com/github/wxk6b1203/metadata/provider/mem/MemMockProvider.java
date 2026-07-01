@@ -28,11 +28,11 @@ public class MemMockProvider extends ManifestMetadataManager {
     }
 
     @Override
-    public synchronized int commitFile(IndexFile file) {
+    public synchronized IndexFileMetadata commitFile(IndexFile file) {
         String key = keyName(file);
         IndexFileMetadata existing = files.get(key);
         long epoch = existing == null ? 1 : existing.getEpoch() + 1;
-        files.put(key, new IndexFileMetadata(
+        IndexFileMetadata metadata = new IndexFileMetadata(
                 file.indexName(),
                 file.name(),
                 file.dataDirectory(),
@@ -42,8 +42,9 @@ public class MemMockProvider extends ManifestMetadataManager {
                 file.checksum(),
                 file.modifiedTime(),
                 IndexFileStatus.DIRTY
-        ));
-        return Math.toIntExact(epoch);
+        );
+        files.put(key, metadata);
+        return metadata;
     }
 
     @Override

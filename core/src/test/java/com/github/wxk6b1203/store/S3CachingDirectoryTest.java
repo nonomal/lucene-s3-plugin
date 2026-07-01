@@ -95,7 +95,7 @@ public class S3CachingDirectoryTest {
     @Test
     public void testDeleteFileKeepsCommittedRemoteSnapshotMetadata() throws IOException {
         MemMockProvider metadata = new MemMockProvider();
-        int cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0));
+        long cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.CLEAN);
 
@@ -111,7 +111,7 @@ public class S3CachingDirectoryTest {
     @Test
     public void testWriterCanHideDeletedRemoteSnapshotFiles() throws IOException {
         MemMockProvider metadata = new MemMockProvider();
-        int cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0));
+        long cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.CLEAN);
         metadata.publishSnapshot("test-index", "segments_1", List.of(metadata.fileMetadata("test-index", "segments_1")));
@@ -128,7 +128,7 @@ public class S3CachingDirectoryTest {
     @Test
     public void testWriterCanHideDeletedLiveManifestFiles() throws IOException {
         MemMockProvider metadata = new MemMockProvider();
-        int cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0));
+        long cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.CLEAN);
 
@@ -144,10 +144,10 @@ public class S3CachingDirectoryTest {
     @Test
     public void testReadOnlySnapshotUsesLastCleanRemoteCommitWhenNewerUploadExists() throws IOException {
         MemMockProvider metadata = new MemMockProvider();
-        int cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0));
+        long cleanEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus("test-index", "segments_1", cleanEpoch, IndexFileStatus.CLEAN);
-        int uploadingEpoch = metadata.commitFile(new IndexFile("test-index", "segments_2", 1, 0));
+        long uploadingEpoch = metadata.commitFile(new IndexFile("test-index", "segments_2", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_2", uploadingEpoch, IndexFileStatus.UPLOADING);
 
         try (S3CachingDirectory directory = newReadOnlyDirectory("test-index", metadata)) {
@@ -174,7 +174,7 @@ public class S3CachingDirectoryTest {
     @Test
     public void testReadOnlySnapshotDoesNotUseUnreadableSharedCache() throws IOException {
         MemMockProvider metadata = new MemMockProvider();
-        int uploadingEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0));
+        long uploadingEpoch = metadata.commitFile(new IndexFile("test-index", "segments_1", 1, 0)).getEpoch();
         metadata.updateFileStatus("test-index", "segments_1", uploadingEpoch, IndexFileStatus.UPLOADING);
         Files.createDirectories(PathUtil.sharedDataPath(tempDir, "test-index"));
         Files.write(PathUtil.sharedDataPath(tempDir, "test-index").resolve("segments_1"), new byte[]{1});
@@ -199,7 +199,7 @@ public class S3CachingDirectoryTest {
 
         String objectKey = indexName + "/_data/" + fileName + ".current";
         remote.putObject(objectKey, current);
-        int epoch = metadata.commitFile(new IndexFile(
+        long epoch = metadata.commitFile(new IndexFile(
                 indexName,
                 fileName,
                 "_data",
@@ -207,7 +207,7 @@ public class S3CachingDirectoryTest {
                 current.length,
                 crc32(current),
                 System.currentTimeMillis()
-        ));
+        )).getEpoch();
         metadata.updateFileStatus(indexName, fileName, epoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus(indexName, fileName, epoch, IndexFileStatus.CLEAN);
 
@@ -240,7 +240,7 @@ public class S3CachingDirectoryTest {
         remote.putObject(oldObjectKey, oldBytes);
         remote.putObject(newObjectKey, newBytes);
 
-        int oldEpoch = metadata.commitFile(new IndexFile(
+        long oldEpoch = metadata.commitFile(new IndexFile(
                 indexName,
                 fileName,
                 "_data",
@@ -248,12 +248,12 @@ public class S3CachingDirectoryTest {
                 oldBytes.length,
                 crc32(oldBytes),
                 System.currentTimeMillis()
-        ));
+        )).getEpoch();
         metadata.updateFileStatus(indexName, fileName, oldEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus(indexName, fileName, oldEpoch, IndexFileStatus.CLEAN);
         metadata.publishSnapshot(indexName, "segments_1", List.of(metadata.fileMetadata(indexName, fileName)));
 
-        int newEpoch = metadata.commitFile(new IndexFile(
+        long newEpoch = metadata.commitFile(new IndexFile(
                 indexName,
                 fileName,
                 "_data",
@@ -261,7 +261,7 @@ public class S3CachingDirectoryTest {
                 newBytes.length,
                 crc32(newBytes),
                 System.currentTimeMillis()
-        ));
+        )).getEpoch();
         metadata.updateFileStatus(indexName, fileName, newEpoch, IndexFileStatus.UPLOADING);
         metadata.updateFileStatus(indexName, fileName, newEpoch, IndexFileStatus.CLEAN);
 

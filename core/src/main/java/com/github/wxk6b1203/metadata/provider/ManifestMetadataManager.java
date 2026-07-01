@@ -6,16 +6,76 @@ import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public abstract class ManifestMetadataManager {
-    public abstract int commitFile(IndexFile file);
+    public abstract IndexFileMetadata commitFile(IndexFile file);
+
+    /**
+     * Commit metadata for a batch of files. Default implementation loops {@link #commitFile},
+     * skipping files that are already CLEAN/PINNED or unchanged (same upload identity) — mirroring
+     * the per-file skip logic so non-etcd providers preserve the upload state machine.
+     * etcd-backed implementations override this with a single transactional CAS so all files in a
+     * commit advance their epoch atomically in one round-trip.
+     *
+     * @return the committed metadata for each input file, in the same order; entries may be null
+     *         when the file is already CLEAN/PINNED (no upload needed) or the existing metadata
+     *         when the upload identity is unchanged.
+     */
+    public List<IndexFileMetadata> commitFiles(List<IndexFile> files) {
+        List<IndexFileMetadata> result = new ArrayList<>(files.size());
+        for (IndexFile file : files) {
+            IndexFileMetadata existing = fileMetadata(file.indexName(), file.name());
+            if (existing != null) {
+                if (existing.getStatus() == IndexFileStatus.CLEAN
+                        || existing.getStatus() == IndexFileStatus.PINNED) {
+                    result.add(null);
+                    continue;
+                }
+                if (sameUpload(existing, file)) {
+                    result.add(existing);
+                    continue;
+                }
+            }
+            result.add(commitFile(file));
+        }
+        return result;
+    }
+
+    private boolean sameUpload(IndexFileMetadata metadata, IndexFile file) {
+        return metadata.getSize() == file.size()
+                && metadata.getChecksum() == file.checksum()
+                && metadata.getModifiedTime() == file.modifiedTime()
+                && java.util.Objects.equals(metadata.getObjectKey(), file.objectKey());
+    }
 
     public abstract void updateFileStatus(String indexName, String fileName, long epoch, IndexFileStatus status);
 
     public abstract List<IndexFileMetadata> listAll(String indexName, List<IndexFileStatus> status);
 
     public abstract IndexFileMetadata fileMetadata(String indexName, String name);
+
+    /**
+     * Read metadata for a specific set of file names in one logical call. Default implementation
+     * loops {@link #fileMetadata}; etcd-backed implementations override with a single read-only
+     * transaction so callers avoid a full prefix range read when they only need a known set of
+     * files. CLEAN file metadata accumulates unbounded across a shard's lifetime (reclaimed only
+     * on whole-index delete), so a prefix read would decode the entire history on every call.
+     */
+    public Map<String, IndexFileMetadata> filesByName(String indexName, Collection<String> names) {
+        Map<String, IndexFileMetadata> result = new HashMap<>(names.size());
+        for (String name : names) {
+            IndexFileMetadata metadata = fileMetadata(indexName, name);
+            if (metadata != null) {
+                result.put(name, metadata);
+            }
+        }
+        return result;
+    }
 
     public abstract long publishSnapshot(String indexName, String segmentFileName, List<IndexFileMetadata> files);
 

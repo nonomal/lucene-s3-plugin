@@ -1137,6 +1137,11 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private ClusterState writableClusterState(RoutingContext context) throws IOException {
+        // Writes must read live cluster state: routing, mappings, and the rebalance/availability
+        // check all need the latest view. A cached read could route to a dead owner (recoverable
+        // via forward failure) but would also serve stale mappings, silently indexing newly mapped
+        // fields only into _source. The write fence catches ownership changes, not mapping changes,
+        // so it cannot backstop a stale mapping read.
         ClusterState state = clusterStateRepository.current();
         log.debug("writable state node={} version={} master={} hasUnavailable={}",
                 localNode.id(), state.version(), state.masterNodeId(), hasUnavailableShardOwner(state));
@@ -1348,6 +1353,9 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private void validateShardWriteFence(ShardId shardId, long ownerTerm, long allocationEpoch) throws IOException {
+        // MUST read live state. The fence detects ownership changes (ownerTerm/allocationEpoch)
+        // that happened since the route was computed; a stale read would make this check a no-op
+        // and allow split-brain writes.
         ShardRouting routing = routingFor(shardId, clusterStateRepository.current());
         if (routing.state() != ShardState.STARTED) {
             throw new IllegalStateException("shard is not writable: " + shardId.routeKey() + " state=" + routing.state());

@@ -28,7 +28,7 @@ public class EtcdManifestMetadataManagerTest {
                 client
         );
         try {
-            int epoch = provider.commitFile(new IndexFile("books__shard_0", "segments_1", 128, 7));
+            long epoch = provider.commitFile(new IndexFile("books__shard_0", "segments_1", 128, 7)).getEpoch();
             provider.updateFileStatus("books__shard_0", "segments_1", epoch, IndexFileStatus.UPLOADING);
             provider.updateFileStatus("books__shard_0", "segments_1", epoch, IndexFileStatus.CLEAN);
 

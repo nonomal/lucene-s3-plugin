@@ -11,6 +11,8 @@ import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
 import io.etcd.jetcd.Client;
 import io.etcd.jetcd.KeyValue;
+import io.etcd.jetcd.kv.GetResponse;
+import io.etcd.jetcd.kv.TxnResponse;
 import io.etcd.jetcd.op.Cmp;
 import io.etcd.jetcd.op.CmpTarget;
 import io.etcd.jetcd.op.Op;
@@ -22,8 +24,11 @@ import lombok.Data;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -31,6 +36,11 @@ import java.util.concurrent.TimeoutException;
 
 public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     private static final int MAX_CAS_RETRIES = 32;
+    // etcd's default --max-txn-ops is 128; a transaction with more ops is rejected with
+    // INVALID_ARGUMENT "too many operations in txn request". Each CAS file costs 2 ops
+    // (one Cmp + one Put), each read-only Op.get costs 1 op, so chunk under these limits.
+    private static final int MAX_TXN_OPS = 128;
+    private static final int CAS_CHUNK_SIZE = MAX_TXN_OPS / 2;
 
     private final Client client;
     private final String namespace;
@@ -61,7 +71,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     }
 
     @Override
-    public int commitFile(IndexFile file) {
+    public IndexFileMetadata commitFile(IndexFile file) {
         ByteSequence key = fileKey(file.indexName(), file.name());
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
@@ -80,7 +90,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         IndexFileStatus.DIRTY
                 );
                 if (putIfCurrent(key, currentKv, metadata)) {
-                    return Math.toIntExact(epoch);
+                    return metadata;
                 }
             } catch (Exception e) {
                 throw storageException("Failed to commit file metadata: " + file.indexName() + "/" + file.name(), e);
@@ -88,6 +98,157 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
         throw new StorageException("Failed to commit file metadata after CAS retries: "
                 + file.indexName() + "/" + file.name());
+    }
+
+    @Override
+    public List<IndexFileMetadata> commitFiles(List<IndexFile> files) {
+        if (files.isEmpty()) {
+            return List.of();
+        }
+        String indexName = files.getFirst().indexName();
+        for (IndexFile file : files) {
+            if (!indexName.equals(file.indexName())) {
+                throw new IllegalArgumentException("commitFiles must target a single physical index");
+            }
+        }
+        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+            try {
+                // Read only the files in this commit (one batched read-only txn) instead of a
+                // full prefix range get. CLEAN file metadata accumulates unbounded across the
+                // shard's lifetime (reclaimed only on whole-index delete), so a prefix read would
+                // decode the entire history on every write.
+                List<String> fileNames = new ArrayList<>(files.size());
+                for (IndexFile file : files) {
+                    fileNames.add(file.name());
+                }
+                Map<String, KeyValue> current = fileKvsByNames(indexName, fileNames);
+                List<IndexFileMetadata> result = new ArrayList<>(files.size());
+                List<BatchCommitEntry> toCommit = new ArrayList<>();
+                for (IndexFile file : files) {
+                    KeyValue currentKv = current.get(file.name());
+                    IndexFileMetadata existing = currentKv == null ? null : decodeFileMetadata(currentKv);
+                    if (existing != null) {
+                        if (existing.getStatus() == IndexFileStatus.CLEAN
+                                || existing.getStatus() == IndexFileStatus.PINNED) {
+                            result.add(null);
+                            continue;
+                        }
+                        if (sameUpload(existing, file)) {
+                            result.add(existing);
+                            continue;
+                        }
+                    }
+                    long epoch = existing == null ? 1 : existing.getEpoch() + 1;
+                    IndexFileMetadata metadata = new IndexFileMetadata(
+                            file.indexName(),
+                            file.name(),
+                            file.dataDirectory(),
+                            file.objectKey(),
+                            epoch,
+                            file.size(),
+                            file.checksum(),
+                            file.modifiedTime(),
+                            IndexFileStatus.DIRTY
+                    );
+                    toCommit.add(new BatchCommitEntry(file, currentKv, metadata));
+                    result.add(metadata);
+                }
+                if (toCommit.isEmpty()) {
+                    return result;
+                }
+                // Chunk the CAS transaction under etcd's max-txn-ops. Chunks are not mutually
+                // atomic: if a later chunk's CAS fails (an upload flipped a status), the whole
+                // loop re-reads and retries — already-committed files re-resolve to sameUpload
+                // skips, so the retry converges to a consistent state. This matches the prior
+                // per-file CAS path, which was never cross-file atomic either.
+                boolean allApplied = true;
+                for (int from = 0; from < toCommit.size(); from += CAS_CHUNK_SIZE) {
+                    int to = Math.min(from + CAS_CHUNK_SIZE, toCommit.size());
+                    if (!putAllIfCurrent(toCommit.subList(from, to))) {
+                        allApplied = false;
+                        break;
+                    }
+                }
+                if (allApplied) {
+                    return result;
+                }
+                // CAS failed: re-read and retry.
+            } catch (Exception e) {
+                throw storageException("Failed to commit file metadata batch: " + indexName, e);
+            }
+        }
+        throw new StorageException("Failed to commit file metadata batch after CAS retries: " + indexName);
+    }
+
+    private Map<String, KeyValue> fileKvsByNames(String indexName, List<String> names) throws Exception {
+        if (names.isEmpty()) {
+            return Map.of();
+        }
+        // Read-only transaction (no If, only Op.get in Then) executes as a single linearizable
+        // snapshot read of the named keys in one round-trip; etcd supports read-only txns.
+        // Chunk under max-txn-ops: each Op.get counts as one op. Each chunk is its own snapshot
+        // read; for the commit/publish callers this is acceptable because a fresh re-read is
+        // already required (async uploads flip statuses), and the CAS re-validates modRevision.
+        Map<String, KeyValue> map = new HashMap<>(names.size());
+        for (int from = 0; from < names.size(); from += MAX_TXN_OPS) {
+            int to = Math.min(from + MAX_TXN_OPS, names.size());
+            List<String> chunk = names.subList(from, to);
+            Op[] getOps = new Op[chunk.size()];
+            for (int i = 0; i < chunk.size(); i++) {
+                getOps[i] = Op.get(fileKey(indexName, chunk.get(i)), GetOption.DEFAULT);
+            }
+            TxnResponse txnResponse = await(client.getKVClient().txn().Then(getOps).commit());
+            List<GetResponse> getResponses = txnResponse.getGetResponses();
+            for (int i = 0; i < chunk.size(); i++) {
+                List<KeyValue> kvs = getResponses.get(i).getKvs();
+                if (!kvs.isEmpty()) {
+                    map.put(chunk.get(i), kvs.getFirst());
+                }
+            }
+        }
+        return map;
+    }
+
+    @Override
+    public Map<String, IndexFileMetadata> filesByName(String indexName, Collection<String> names) {
+        if (names.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            List<String> ordered = new ArrayList<>(names);
+            Map<String, KeyValue> kvs = fileKvsByNames(indexName, ordered);
+            Map<String, IndexFileMetadata> result = new HashMap<>(kvs.size());
+            for (Map.Entry<String, KeyValue> entry : kvs.entrySet()) {
+                result.put(entry.getKey(), decodeFileMetadata(entry.getValue()));
+            }
+            return result;
+        } catch (Exception e) {
+            throw storageException("Failed to batch-read file metadata: " + indexName, e);
+        }
+    }
+
+    private boolean putAllIfCurrent(List<BatchCommitEntry> entries) throws Exception {
+        Cmp[] cmps = new Cmp[entries.size()];
+        Op[] ops = new Op[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            BatchCommitEntry entry = entries.get(i);
+            ByteSequence key = fileKey(entry.file.indexName(), entry.file.name());
+            cmps[i] = entry.currentKv == null
+                    ? new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+                    : new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(entry.currentKv.getModRevision()));
+            ops[i] = Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(entry.metadata)), PutOption.DEFAULT);
+        }
+        return await(client.getKVClient().txn().If(cmps).Then(ops).commit()).isSucceeded();
+    }
+
+    private boolean sameUpload(IndexFileMetadata metadata, IndexFile file) {
+        return metadata.getSize() == file.size()
+                && metadata.getChecksum() == file.checksum()
+                && metadata.getModifiedTime() == file.modifiedTime()
+                && Objects.equals(metadata.getObjectKey(), file.objectKey());
+    }
+
+    private record BatchCommitEntry(IndexFile file, KeyValue currentKv, IndexFileMetadata metadata) {
     }
 
     @Override
@@ -147,10 +308,10 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     public long publishSnapshot(String indexName, String segmentFileName, List<IndexFileMetadata> files) {
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
-                long generation = listSnapshots(indexName).stream()
-                        .mapToLong(IndexCommitSnapshot::getGeneration)
-                        .max()
-                        .orElse(0) + 1;
+                // Snapshot keys are zero-padded (%020d), so lexicographic descending order equals
+                // numeric descending order; a limit-1 descending range get returns the highest
+                // generation without decoding every snapshot.
+                long generation = latestGeneration(indexName) + 1;
                 IndexCommitSnapshot snapshot = new IndexCommitSnapshot(
                         indexName,
                         generation,
@@ -177,9 +338,28 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
 
     @Override
     public IndexCommitSnapshot latestSnapshot(String indexName) {
-        return listSnapshots(indexName).stream()
-                .max(Comparator.comparingLong(IndexCommitSnapshot::getGeneration))
-                .orElse(null);
+        try {
+            KeyValue kv = latestSnapshotKv(indexName);
+            return kv == null ? null : decodeSnapshot(kv);
+        } catch (Exception e) {
+            throw storageException("Failed to get latest commit snapshot: " + indexName, e);
+        }
+    }
+
+    private long latestGeneration(String indexName) throws Exception {
+        KeyValue kv = latestSnapshotKv(indexName);
+        return kv == null ? 0 : decodeSnapshot(kv).getGeneration();
+    }
+
+    private KeyValue latestSnapshotKv(String indexName) throws Exception {
+        var response = await(client.getKVClient()
+                .get(snapshotPrefix(indexName), GetOption.builder()
+                        .isPrefix(true)
+                        .withLimit(1)
+                        .withSortOrder(GetOption.SortOrder.DESCEND)
+                        .withSortField(GetOption.SortTarget.KEY)
+                        .build()));
+        return response.getKvs().isEmpty() ? null : response.getKvs().getFirst();
     }
 
     @Override
