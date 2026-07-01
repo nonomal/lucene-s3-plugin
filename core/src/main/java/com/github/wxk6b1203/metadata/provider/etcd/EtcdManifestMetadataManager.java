@@ -36,6 +36,11 @@ import java.util.concurrent.TimeoutException;
 
 public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     private static final int MAX_CAS_RETRIES = 32;
+    // etcd's default --max-txn-ops is 128; a transaction with more ops is rejected with
+    // INVALID_ARGUMENT "too many operations in txn request". Each CAS file costs 2 ops
+    // (one Cmp + one Put), each read-only Op.get costs 1 op, so chunk under these limits.
+    private static final int MAX_TXN_OPS = 128;
+    private static final int CAS_CHUNK_SIZE = MAX_TXN_OPS / 2;
 
     private final Client client;
     private final String namespace;
@@ -151,7 +156,20 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                 if (toCommit.isEmpty()) {
                     return result;
                 }
-                if (putAllIfCurrent(toCommit)) {
+                // Chunk the CAS transaction under etcd's max-txn-ops. Chunks are not mutually
+                // atomic: if a later chunk's CAS fails (an upload flipped a status), the whole
+                // loop re-reads and retries — already-committed files re-resolve to sameUpload
+                // skips, so the retry converges to a consistent state. This matches the prior
+                // per-file CAS path, which was never cross-file atomic either.
+                boolean allApplied = true;
+                for (int from = 0; from < toCommit.size(); from += CAS_CHUNK_SIZE) {
+                    int to = Math.min(from + CAS_CHUNK_SIZE, toCommit.size());
+                    if (!putAllIfCurrent(toCommit.subList(from, to))) {
+                        allApplied = false;
+                        break;
+                    }
+                }
+                if (allApplied) {
                     return result;
                 }
                 // CAS failed: re-read and retry.
@@ -168,17 +186,24 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
         // Read-only transaction (no If, only Op.get in Then) executes as a single linearizable
         // snapshot read of the named keys in one round-trip; etcd supports read-only txns.
-        Op[] getOps = new Op[names.size()];
-        for (int i = 0; i < names.size(); i++) {
-            getOps[i] = Op.get(fileKey(indexName, names.get(i)), GetOption.DEFAULT);
-        }
-        TxnResponse txnResponse = await(client.getKVClient().txn().Then(getOps).commit());
-        List<GetResponse> getResponses = txnResponse.getGetResponses();
+        // Chunk under max-txn-ops: each Op.get counts as one op. Each chunk is its own snapshot
+        // read; for the commit/publish callers this is acceptable because a fresh re-read is
+        // already required (async uploads flip statuses), and the CAS re-validates modRevision.
         Map<String, KeyValue> map = new HashMap<>(names.size());
-        for (int i = 0; i < names.size(); i++) {
-            List<KeyValue> kvs = getResponses.get(i).getKvs();
-            if (!kvs.isEmpty()) {
-                map.put(names.get(i), kvs.getFirst());
+        for (int from = 0; from < names.size(); from += MAX_TXN_OPS) {
+            int to = Math.min(from + MAX_TXN_OPS, names.size());
+            List<String> chunk = names.subList(from, to);
+            Op[] getOps = new Op[chunk.size()];
+            for (int i = 0; i < chunk.size(); i++) {
+                getOps[i] = Op.get(fileKey(indexName, chunk.get(i)), GetOption.DEFAULT);
+            }
+            TxnResponse txnResponse = await(client.getKVClient().txn().Then(getOps).commit());
+            List<GetResponse> getResponses = txnResponse.getGetResponses();
+            for (int i = 0; i < chunk.size(); i++) {
+                List<KeyValue> kvs = getResponses.get(i).getKvs();
+                if (!kvs.isEmpty()) {
+                    map.put(chunk.get(i), kvs.getFirst());
+                }
             }
         }
         return map;
