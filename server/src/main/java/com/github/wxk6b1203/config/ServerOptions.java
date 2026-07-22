@@ -38,7 +38,8 @@ public record ServerOptions(
         int metricsPort,
         int maxWriteRequests,
         int maxBulkItems,
-        long maxBulkBytes
+        long maxBulkBytes,
+        long maxHttpBodyBytes
 ) {
     public ServerOptions {
         etcdTimeoutSeconds = Math.max(1, etcdTimeoutSeconds);
@@ -62,6 +63,7 @@ public record ServerOptions(
         maxWriteRequests = Math.max(0, maxWriteRequests);
         maxBulkItems = Math.max(0, maxBulkItems);
         maxBulkBytes = Math.max(0, maxBulkBytes);
+        maxHttpBodyBytes = Math.max(0, maxHttpBodyBytes);
     }
 
     public ServerOptions(
@@ -114,6 +116,7 @@ public record ServerOptions(
                 null,
                 0,
                 60,
+                0,
                 0,
                 0,
                 0,
@@ -172,6 +175,7 @@ public record ServerOptions(
                 null,
                 0,
                 60,
+                0,
                 0,
                 0,
                 0,
@@ -235,6 +239,7 @@ public record ServerOptions(
                 0,
                 0,
                 0,
+                0,
                 0
         );
     }
@@ -294,6 +299,7 @@ public record ServerOptions(
                 cacheMaxBytes,
                 cacheCleanupIntervalSeconds,
                 metricsPort,
+                0,
                 0,
                 0,
                 0

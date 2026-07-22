@@ -125,6 +125,9 @@ public class Server implements Callable<Integer> {
     @CommandLine.Option(names = {"--max-bulk-bytes"}, description = "Maximum request body bytes accepted by the bulk API. 0 disables the limit.")
     private long maxBulkBytes = 0;
 
+    @CommandLine.Option(names = {"--max-http-body-bytes"}, description = "Maximum request body bytes for non-bulk HTTP routes (e.g. single-doc, search). 0 disables the limit.")
+    private long maxHttpBodyBytes = 100L * 1024 * 1024;
+
     @CommandLine.Option(names = {"--analyzer-plugin-path"}, description = "Directory or jar file containing third-party Lucene Analyzer plugins")
     private String analyzerPluginPath;
 
@@ -252,7 +255,10 @@ public class Server implements Callable<Integer> {
                         "server.maxBulkItems", "server.bulk.maxItems", "server.bulk.max.items")),
                 optionValue("--max-bulk-bytes", maxBulkBytes, () -> config.longValue(maxBulkBytes,
                         "maxBulkBytes", "bulk.maxBytes", "bulk.max.bytes",
-                        "server.maxBulkBytes", "server.bulk.maxBytes", "server.bulk.max.bytes"))
+                        "server.maxBulkBytes", "server.bulk.maxBytes", "server.bulk.max.bytes")),
+                optionValue("--max-http-body-bytes", maxHttpBodyBytes, () -> config.longValue(maxHttpBodyBytes,
+                        "maxHttpBodyBytes", "http.maxBodyBytes", "http.max.body.bytes",
+                        "server.maxHttpBodyBytes", "server.http.maxBodyBytes", "server.http.max.body.bytes"))
         );
     }
 
