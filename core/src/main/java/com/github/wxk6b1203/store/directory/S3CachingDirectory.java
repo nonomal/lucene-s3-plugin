@@ -457,13 +457,21 @@ public class S3CachingDirectory extends BaseDirectory {
         } catch (NoSuchFileException e) {
             return false;
         }
-        if (cacheMatches(sharedFile, metadata)) {
-            RemoteCacheStats.hit();
-            try {
-                Files.setLastModifiedTime(sharedFile, FileTime.fromMillis(System.currentTimeMillis()));
-            } catch (IOException ignored) {
+        try {
+            if (cacheMatches(sharedFile, metadata)) {
+                RemoteCacheStats.hit();
+                try {
+                    Files.setLastModifiedTime(sharedFile, FileTime.fromMillis(System.currentTimeMillis()));
+                } catch (IOException ignored) {
+                }
+                return true;
             }
-            return true;
+        } catch (NoSuchFileException e) {
+            // The shared cache file was deleted between the Files.exists check above and the
+            // size/checksum read (e.g. by cache eviction or the shard writer deleting a stale
+            // segment). Treat it as a miss so openInput re-downloads via cacheRemoteFile instead
+            // of failing the read.
+            return false;
         }
         RemoteCacheStats.corruption();
         deleteIfExists(sharedFile);

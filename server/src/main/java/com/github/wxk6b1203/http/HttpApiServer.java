@@ -88,6 +88,7 @@ public class HttpApiServer implements AutoCloseable {
     private final ServerMetrics serverMetrics;
     private final WriteBackpressure writeBackpressure;
     private final long bulkBodyLimit;
+    private final long httpBodyLimit;
     private final Duration forwardTimeout;
     private final long writeMaintenanceIntervalMillis;
     private final boolean weakRemoteSnapshotReadsEnabled;
@@ -205,6 +206,7 @@ public class HttpApiServer implements AutoCloseable {
                 options.maxBulkBytes()
         );
         this.bulkBodyLimit = bodyLimit(options.maxBulkBytes());
+        this.httpBodyLimit = bodyLimit(options.maxHttpBodyBytes());
         this.localShardIndexService = new LuceneLocalShardIndexService(
                 dataPath,
                 options.s3Enabled() ? options.s3Bucket() : "lucene-s3",
@@ -374,7 +376,13 @@ public class HttpApiServer implements AutoCloseable {
                 .handler(BodyHandler.create().setBodyLimit(-1))
                 .handler(this::recordBodyReadStage)
                 .blockingHandler(this::internalShardBulk, false);
-        router.route().handler(BodyHandler.create());
+        // Internal node-to-node routes are exempt from the HTTP body limit: forwarded bulk
+        // batches and search/pit bodies are bounded by what the coordinating node already
+        // accepted, and an explicit cap here could reject legitimate internal traffic. This is
+        // registered before the global BodyHandler; Vert.x reads the body at most once
+        // (BodyHandler marks the routing context seen), so the global handler is a no-op here.
+        router.route("/_internal/*").handler(BodyHandler.create().setBodyLimit(-1));
+        router.route().handler(BodyHandler.create().setBodyLimit(httpBodyLimit));
         router.route().handler(this::recordBodyReadStage);
 
         router.post("/_internal/:index/:shard/_search").blockingHandler(this::internalShardSearch, false);
@@ -1643,8 +1651,14 @@ public class HttpApiServer implements AutoCloseable {
             Map<String, FieldMapping> mappings = indexSettings(request.indexName(), state).mappings();
             validateVectorQuery(request.vector(), mappings);
             request = withMappings(request, mappings);
-            SearchPlan plan = searchPlan(request, state);
-            executeSearchPlan(plan, request, requestStartedNanos(context))
+            CoordinatingPit pit = coordinatingPit(request.pitId());
+            if (pit != null && !pit.indexName().equals(request.indexName())) {
+                throw new IllegalArgumentException("point in time does not belong to index: " + request.indexName());
+            }
+            SearchPlan plan = pit == null
+                    ? searchPlan(request, state)
+                    : new SearchPlan(request.indexName(), request.routing(), state.version(), pit.targets());
+            executeSearchPlan(plan, request, pit, requestStartedNanos(context))
                     .onSuccess(response -> json(context, 200, response))
                     .onFailure(e -> {
                         Exception exception = exception(e);

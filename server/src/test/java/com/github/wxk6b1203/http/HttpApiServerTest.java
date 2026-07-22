@@ -152,6 +152,46 @@ class HttpApiServerTest {
 
     @Test
     @Timeout(60)
+    void knnSearchHonorsPointInTime() throws Exception {
+        startServer();
+        createBooksIndex();
+        // doc-1 is a near match for the query vector; doc-2 is far.
+        indexBook("doc-1", "visible", 100, List.of(0.9, 0.1));
+        indexBook("doc-2", "visible", 200, List.of(0.0, 1.0));
+
+        // Open a PIT pinning the current generation before doc-3 exists.
+        String pitId = stringValue(post("/books/_pit?keep_alive=1m", Map.of(), 200).get("id"));
+
+        // doc-3 is an exact match for the query vector, but is indexed after the PIT was opened.
+        indexBook("doc-3", "visible", 150, List.of(1.0, 0.0));
+
+        Map<String, Object> knn = Map.of(
+                "field", "embedding",
+                "query_vector", List.of(1.0, 0.0),
+                "k", 1,
+                "num_candidates", 10
+        );
+
+        // A PIT-scoped _knn_search must read the pinned generation and exclude doc-3, so the
+        // nearest visible document is doc-1. (Before the fix, _knn_search ignored the PIT and
+        // read the latest generation, returning doc-3.)
+        Map<String, Object> pitKnnSearch = post("/books/_knn_search", Map.of(
+                "knn", knn,
+                "pit", Map.of("id", pitId)
+        ), 200);
+        assertEquals(List.of("doc-1"), hitIds(pitKnnSearch));
+
+        // A current _knn_search reads the latest generation and returns the exact match doc-3.
+        Map<String, Object> currentKnnSearch = post("/books/_knn_search", Map.of(
+                "knn", knn
+        ), 200);
+        assertEquals(List.of("doc-3"), hitIds(currentKnnSearch));
+
+        assertTrue((Boolean) delete("/_pit", Map.of("id", pitId), 200).get("succeeded"));
+    }
+
+    @Test
+    @Timeout(60)
     @SuppressWarnings("unchecked")
     void lifecyclePolicyStoresParsedPhaseMinAgesAndCanBeAttached() throws Exception {
         startServer();
@@ -1007,7 +1047,8 @@ class HttpApiServerTest {
                 0,
                 maxWriteRequests,
                 maxBulkItems,
-                maxBulkBytes
+                maxBulkBytes,
+                0
         ));
         server.start().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
     }

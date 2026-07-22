@@ -89,6 +89,12 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
                 if (response.isSucceeded()) {
                     return next;
                 }
+            } catch (RuntimeException e) {
+                // Business exceptions (e.g. IllegalArgumentException for "index is deleting" or
+                // "index not found") must propagate unwrapped so they map to the same HTTP status
+                // as single-node mode. Wrapping them in IOException would turn a 400 into a 500
+                // and make error codes depend on whether etcd is configured.
+                throw e;
             } catch (Exception e) {
                 throw ioException("failed to update cluster state", e);
             }
