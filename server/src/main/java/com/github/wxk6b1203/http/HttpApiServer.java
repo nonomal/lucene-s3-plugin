@@ -7,6 +7,7 @@ import com.github.wxk6b1203.config.ServerOptions;
 import com.github.wxk6b1203.errors.NotMasterException;
 import com.github.wxk6b1203.index.*;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.metadata.provider.etcd.EtcdManifestMetadataManager;
@@ -271,8 +272,19 @@ public class HttpApiServer implements AutoCloseable {
                     AwsBasicCredentials.create(options.s3AccessKey(), options.s3SecretKey())
             ));
         }
-        this.s3Client = builder.build();
-        return new S3RemoteObjectStore(options.s3Bucket(), s3Client);
+        this.s3Client = builder.overrideConfiguration(override -> {
+            if (options.s3ApiCallTimeoutSeconds() > 0) {
+                // Per-attempt timeout: without it a hung endpoint blocks upload workers (and the
+                // close-time drain) for the SDK's default, which is unbounded.
+                override.apiCallAttemptTimeout(Duration.ofSeconds(options.s3ApiCallTimeoutSeconds()));
+            }
+        }).build();
+        return new S3RemoteObjectStore(
+                options.s3Bucket(),
+                s3Client,
+                options.s3MultipartMinFileSizeBytes(),
+                options.s3MultipartPartSizeBytes()
+        );
     }
 
     private URI s3Endpoint(String endpoint, String protocol) {
@@ -2404,24 +2416,15 @@ public class HttpApiServer implements AutoCloseable {
 
         private boolean load(ShardId shardId) {
             try {
-                String physicalIndexName = physicalIndexName(shardId);
-                IndexCommitSnapshot snapshot = manifestMetadataManager.latestSnapshot(physicalIndexName);
-                if (snapshot == null) {
-                    cache.put(shardId, false);
-                    return false;
-                }
-                // Only pending statuses matter for readiness; decoding the (potentially long)
-                // CLEAN history on every probe is pure etcd load.
-                boolean ready = manifestMetadataManager.listAll(physicalIndexName, List.of(
-                                IndexFileStatus.DIRTY,
-                                IndexFileStatus.UPLOADING
-                        ))
-                        .isEmpty();
-                // Cache both outcomes. Readiness is NOT monotonic: a fresh write flips it
-                // true -> false (files become DIRTY/UPLOADING), so a cached true must be
-                // overwritable. Caching false is what preserves read-your-writes for weak reads
-                // during the async upload window — they route to the shard owner instead of a
-                // stale remote generation. Stale values are bounded by the refresh tick.
+                // One summary GET replaces the per-shard file-history scan; the pending count is
+                // maintained in the same transactions as the file entries it counts. A fresh write
+                // bumps pendingCount (>0), so a cached true is overwritable and read-your-writes
+                // for weak reads is preserved: not-ready routes to the shard owner. Stale values
+                // are bounded by the refresh tick.
+                ShardSummary summary = manifestMetadataManager.shardSummary(physicalIndexName(shardId));
+                boolean ready = summary != null
+                        && summary.latestGeneration() > 0
+                        && summary.pendingCount() == 0;
                 cache.put(shardId, ready);
                 return ready;
             } catch (Exception e) {
@@ -2440,8 +2443,20 @@ public class HttpApiServer implements AutoCloseable {
                 live.add(routing.shardId());
             }
             cache.keySet().retainAll(live);
+            // One range read covers every shard's summary; shards without a summary stay
+            // not-ready (owner reads) until their first commit creates one.
+            Map<String, ShardSummary> summaries;
+            try {
+                summaries = manifestMetadataManager.shardSummaries();
+            } catch (Exception e) {
+                log.debug("failed to list shard summaries for readiness refresh", e);
+                return;
+            }
             for (ShardId shardId : live) {
-                load(shardId);
+                ShardSummary summary = summaries.get(physicalIndexName(shardId));
+                cache.put(shardId, summary != null
+                        && summary.latestGeneration() > 0
+                        && summary.pendingCount() == 0);
             }
         }
     }

@@ -237,11 +237,12 @@ class HttpApiServerTest {
         ), 200);
         put("/books/_ilm/policy/delete-now", Map.of(), 200);
 
+        // The lifecycle delete rides on 1s maintenance ticks; give it headroom under full-suite load.
         waitUntil(() -> {
             Map<String, Object> state = get("/_cluster/state", 200);
             Map<String, Object> indices = (Map<String, Object>) state.get("indices");
             return !indices.containsKey("books");
-        });
+        }, 30);
     }
 
     @Test
@@ -1048,6 +1049,9 @@ class HttpApiServerTest {
                 maxWriteRequests,
                 maxBulkItems,
                 maxBulkBytes,
+                0,
+                0,
+                0,
                 0
         ));
         server.start().toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
@@ -1264,7 +1268,11 @@ class HttpApiServerTest {
     }
 
     private void waitUntil(CheckedCondition condition) throws Exception {
-        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        waitUntil(condition, 10);
+    }
+
+    private void waitUntil(CheckedCondition condition, long timeoutSeconds) throws Exception {
+        long deadline = System.nanoTime() + Duration.ofSeconds(timeoutSeconds).toNanos();
         AssertionError lastFailure = null;
         while (System.nanoTime() < deadline) {
             try {

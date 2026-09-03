@@ -1,6 +1,10 @@
 package com.github.wxk6b1203.http;
 
+import com.github.wxk6b1203.cluster.ClusterState;
 import com.github.wxk6b1203.cluster.NodeRole;
+import com.github.wxk6b1203.cluster.ShardRouting;
+import com.github.wxk6b1203.cluster.ShardState;
+import com.github.wxk6b1203.cluster.etcd.EtcdClusterStateRepository;
 import com.github.wxk6b1203.config.ServerOptions;
 import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
@@ -19,6 +23,7 @@ import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -397,6 +402,131 @@ public class EtcdHttpApiServerTest {
         return ((List<Map<String, Object>>) response.get("hits")).stream()
                 .map(hit -> String.valueOf(hit.get("id")))
                 .toList();
+    }
+
+    @Test
+    @Timeout(120)
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    @SuppressWarnings("unchecked")
+    public void retireDeposedOwnerDrainsUploadsOnlyAndQuarantinesWal() throws Exception {
+        String namespace = "test-http/" + UUID.randomUUID();
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        try {
+            ServerHandle node1 = startServer(namespace, "node-1", Set.of(NodeRole.MASTER, NodeRole.DATA, NodeRole.COORDINATING));
+            // Real S3 is shared between nodes; point node-2's local "remote" store at node-1's
+            // so objects uploaded by node-1 are visible to node-2 (as in production).
+            Files.createDirectories(tempDir.resolve("node-1/remote-objects"));
+            Files.createDirectories(tempDir.resolve("node-2"));
+            Files.createSymbolicLink(tempDir.resolve("node-2/remote-objects"),
+                    tempDir.resolve("node-1/remote-objects").toAbsolutePath());
+            ServerHandle node2 = startServer(namespace, "node-2", Set.of(NodeRole.DATA, NodeRole.COORDINATING));
+            waitUntil(() -> get(node1, "/_nodes", 200).keySet().containsAll(Set.of("node-1", "node-2")));
+            waitUntil(() -> "node-1".equals(get(node1, "/_cluster/state", 200).get("masterNodeId")));
+            put(node1, "/books", Map.of(
+                    "number_of_shards", 1,
+                    "mappings", Map.of("properties", Map.of("category", Map.of("type", "keyword")))), 200);
+            waitUntil(() -> hasShardOwner(node1, "books", 0));
+            // Deterministic allocation: with equal load the lowest node id wins.
+            assertEquals("node-1", shardOwner(node1, "books", 0));
+
+            String routing = routingForShard(0, 1);
+            post(node2, "/books/_doc/retire-doc?routing=" + routing, Map.of("category", "retire"), 201);
+            waitUntil(() -> shardUploadReady(node1, "books", 0));
+
+            // Simulate the master deciding to move the shard to node-2 while node-1 is alive:
+            // rewrite the routing entry with a bumped owner term and allocation epoch.
+            EtcdClusterStateRepository repository = new EtcdClusterStateRepository(
+                    EtcdClusterStateRepository.Options.builder()
+                            .endpoints(System.getenv("ETCD_TEST_ENDPOINTS"))
+                            .clusterName("test-cluster")
+                            .namespace(namespace)
+                            .build(),
+                    client);
+            repository.update(state -> new ClusterState(
+                    state.clusterName(),
+                    state.version(),
+                    state.masterNodeId(),
+                    state.nodes(),
+                    state.indices(),
+                    state.routingTable().stream()
+                            .map(routingEntry -> "books".equals(routingEntry.shardId().indexName())
+                                    ? new ShardRouting(
+                                            routingEntry.shardId(),
+                                            ShardState.STARTED,
+                                            "node-2",
+                                            routingEntry.ownerTerm() + 1,
+                                            routingEntry.allocationEpoch() + 1)
+                                    : routingEntry)
+                            .toList(),
+                    state.lifecyclePolicies(),
+                    state.updatedAt()));
+
+            // The deposed node's reconcile tick must drain (upload-only), close its writer, and
+            // quarantine the WAL so stale same-name files can never shadow the new owner's data.
+            waitUntil(() -> !Files.exists(tempDir.resolve("node-1/_wal/books__shard_0"))
+                    && hasFiles(tempDir.resolve("node-1/orphan-wal")));
+            assertEquals("node-2", shardOwner(node1, "books", 0));
+
+            // New owner accepts writes for the moved shard and both documents stay visible.
+            post(node1, "/books/_doc/after-move?routing=" + routing, Map.of("category", "retire"), 201);
+            waitUntil(() -> Files.isDirectory(tempDir.resolve("node-2/_wal/books__shard_0/_data")));
+            // Weak reads tolerate staleness bounded by the readiness refresh tick (the cached
+            // ready flag may predate the newest write by <1s); owner and strong are strict.
+            waitUntil(() -> {
+                try {
+                    return Set.of("retire-doc", "after-move")
+                            .equals(Set.copyOf(hitIds(post(node2, "/books/_search", Map.of(
+                                    "query", Map.of("term", Map.of("category", "retire")),
+                                    "size", 10
+                            ), 200))));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            Map<String, Object> ownerSearch = post(node2, "/_internal/books/0/_search", Map.of(
+                    "query", Map.of("term", Map.of("category", "retire")),
+                    "from", 0,
+                    "size", 10,
+                    "read_preference", "owner"
+            ), 200);
+            assertEquals(Set.of("retire-doc", "after-move"), Set.copyOf(hitIds(ownerSearch)));
+            Map<String, Object> strongSearch = post(node2, "/books/_search?read_preference=strong", Map.of(
+                    "query", Map.of("term", Map.of("category", "retire")),
+                    "size", 10
+            ), 200);
+            assertEquals(Set.of("retire-doc", "after-move"), Set.copyOf(hitIds(strongSearch)));
+        } finally {
+            closeServers();
+            deletePrefix(client, namespace);
+            client.close();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean shardUploadReady(ServerHandle server, String indexName, int shardNumber) throws Exception {
+        Map<String, Object> status = get(server, "/_uploads", 200);
+        List<Map<String, Object>> indices = (List<Map<String, Object>>) status.get("indices");
+        for (Map<String, Object> index : indices) {
+            if (!indexName.equals(index.get("index"))) {
+                continue;
+            }
+            List<Map<String, Object>> shards = (List<Map<String, Object>>) index.get("shards");
+            for (Map<String, Object> shard : shards) {
+                if (shardNumber == ((Number) shard.get("shard")).intValue()) {
+                    return Boolean.TRUE.equals(shard.get("remote_snapshot_ready"));
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFiles(Path path) throws IOException {
+        if (!Files.isDirectory(path)) {
+            return false;
+        }
+        try (var files = Files.list(path)) {
+            return files.findAny().isPresent();
+        }
     }
 
     private boolean hasShardOwner(ServerHandle server, String indexName, int shardNumber) throws Exception {
