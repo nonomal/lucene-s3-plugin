@@ -144,6 +144,11 @@ public class MemMockProvider extends ManifestMetadataManager {
     }
 
     @Override
+    public synchronized void deleteFile(String indexName, String name) {
+        files.remove(keyName(indexName, name));
+    }
+
+    @Override
     public synchronized void deleteByStatus(String indexName, List<IndexFileStatus> statuses) {
         String prefix = indexName + "/";
         files.entrySet().removeIf(entry -> entry.getKey().startsWith(prefix)

@@ -127,17 +127,20 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                 for (IndexFile file : files) {
                     KeyValue currentKv = current.get(file.name());
                     IndexFileMetadata existing = currentKv == null ? null : decodeFileMetadata(currentKv);
-                    if (existing != null) {
+                    if (existing != null && sameUpload(existing, file)) {
+                        // Same name AND same content: skip only when already durable remotely; otherwise
+                        // reuse the existing metadata so the upload state machine continues.
                         if (existing.getStatus() == IndexFileStatus.CLEAN
                                 || existing.getStatus() == IndexFileStatus.PINNED) {
                             result.add(null);
-                            continue;
-                        }
-                        if (sameUpload(existing, file)) {
+                        } else {
                             result.add(existing);
-                            continue;
                         }
+                        continue;
                     }
+                    // Same name but different content (divergent owner histories colliding on one segment
+                    // name after failover) must re-commit with a bumped epoch. A CLEAN-status skip alone
+                    // would keep the stale objectKey published and corrupt the new history line.
                     long epoch = existing == null ? 1 : existing.getEpoch() + 1;
                     IndexFileMetadata metadata = new IndexFileMetadata(
                             file.indexName(),
@@ -178,6 +181,130 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
             }
         }
         throw new StorageException("Failed to commit file metadata batch after CAS retries: " + indexName);
+    }
+
+    @Override
+    public Map<String, FileVersion> fileVersionsByName(String indexName, Collection<String> names) {
+        try {
+            Map<String, KeyValue> kvs = fileKvsByNames(indexName, new ArrayList<>(names));
+            Map<String, FileVersion> result = new HashMap<>(kvs.size());
+            kvs.forEach((name, kv) -> result.put(name, new FileVersion(name, decodeFileMetadata(kv), kv.getModRevision())));
+            return result;
+        } catch (Exception e) {
+            throw storageException("Failed to batch-read file versions: " + indexName, e);
+        }
+    }
+
+    @Override
+    public StatusFlipOutcome compareAndSetStatus(String indexName, FileVersion expected, IndexFileStatus to) {
+        ByteSequence key = fileKey(indexName, expected.fileName());
+        FileVersion current = expected;
+        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+            try {
+                if (current.modRevision() < 0) {
+                    // No revision available (e.g. caller read through the default base-class path):
+                    // fetch it first so the CAS below stays a single round trip.
+                    KeyValue kv = fileKv(key);
+                    if (kv == null) {
+                        return new StatusFlipOutcome(false, null);
+                    }
+                    current = new FileVersion(expected.fileName(), decodeFileMetadata(kv), kv.getModRevision());
+                    if (current.metadata().getEpoch() != expected.metadata().getEpoch()) {
+                        return new StatusFlipOutcome(false, current);
+                    }
+                }
+                IndexFileMetadata updated = copyWithStatus(current.metadata(), to);
+                TxnResponse response = await(client.getKVClient().txn()
+                        .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(current.modRevision())))
+                        .Then(
+                                Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(updated)), PutOption.DEFAULT),
+                                Op.get(key, GetOption.DEFAULT)
+                        )
+                        .Else(Op.get(key, GetOption.DEFAULT))
+                        .commit());
+                // jetcd's TxnResponse.getGetResponses() only contains responses for get ops (puts
+                // are omitted), so the single Op.get sits at index 0 in both branches.
+                List<GetResponse> getResponses = response.getGetResponses();
+                List<KeyValue> afterKvs = getResponses.getFirst().getKvs();
+                KeyValue afterKv = afterKvs.isEmpty() ? null : afterKvs.getFirst();
+                if (response.isSucceeded()) {
+                    FileVersion updatedVersion = afterKv == null
+                            ? null
+                            : new FileVersion(expected.fileName(), decodeFileMetadata(afterKv), afterKv.getModRevision());
+                    return new StatusFlipOutcome(true, updatedVersion);
+                }
+                if (afterKv == null) {
+                    return new StatusFlipOutcome(false, null);
+                }
+                IndexFileMetadata stored = decodeFileMetadata(afterKv);
+                if (stored.getEpoch() != expected.metadata().getEpoch()) {
+                    return new StatusFlipOutcome(false, new FileVersion(expected.fileName(), stored, afterKv.getModRevision()));
+                }
+                if (stored.getStatus() == to) {
+                    return new StatusFlipOutcome(true, new FileVersion(expected.fileName(), stored, afterKv.getModRevision()));
+                }
+                // Concurrent write with the same epoch: retry the CAS against the fresh revision.
+                current = new FileVersion(expected.fileName(), stored, afterKv.getModRevision());
+            } catch (Exception e) {
+                throw storageException("Failed to flip file status: " + indexName + "/" + expected.fileName(), e);
+            }
+        }
+        throw new StorageException("Failed to flip file status after CAS retries: "
+                + indexName + "/" + expected.fileName());
+    }
+
+    private IndexFileMetadata copyWithStatus(IndexFileMetadata metadata, IndexFileStatus status) {
+        return new IndexFileMetadata(
+                metadata.getIndexName(),
+                metadata.getName(),
+                metadata.getDataDirectory(),
+                metadata.getObjectKey(),
+                metadata.getEpoch(),
+                metadata.getSize(),
+                metadata.getChecksum(),
+                metadata.getModifiedTime(),
+                status
+        );
+    }
+
+    @Override
+    public void deleteFile(String indexName, String name) {
+        try {
+            KeyValue kv = fileKv(fileKey(indexName, name));
+            if (kv != null) {
+                deleteKvsIfUnchanged(List.of(kv));
+            }
+        } catch (Exception e) {
+            throw storageException("Failed to delete file metadata: " + indexName + "/" + name, e);
+        }
+    }
+
+    @Override
+    public void deleteFiles(String indexName, Collection<String> names) {
+        try {
+            Map<String, KeyValue> kvs = fileKvsByNames(indexName, new ArrayList<>(names));
+            List<KeyValue> entries = new ArrayList<>(kvs.values());
+            for (int from = 0; from < entries.size(); from += CAS_CHUNK_SIZE) {
+                deleteKvsIfUnchanged(entries.subList(from, Math.min(from + CAS_CHUNK_SIZE, entries.size())));
+            }
+        } catch (Exception e) {
+            throw storageException("Failed to batch-delete file metadata: " + indexName, e);
+        }
+    }
+
+    /** Revision-guarded batched delete: one transaction per chunk, skipping entries changed in between. */
+    private void deleteKvsIfUnchanged(List<KeyValue> entries) throws Exception {
+        if (entries.isEmpty()) {
+            return;
+        }
+        Cmp[] cmps = new Cmp[entries.size()];
+        Op[] ops = new Op[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            KeyValue kv = entries.get(i);
+            cmps[i] = new Cmp(kv.getKey(), Cmp.Op.EQUAL, CmpTarget.modRevision(kv.getModRevision()));
+            ops[i] = Op.delete(kv.getKey(), DeleteOption.DEFAULT);
+        }
+        await(client.getKVClient().txn().If(cmps).Then(ops).commit());
     }
 
     private Map<String, KeyValue> fileKvsByNames(String indexName, List<String> names) throws Exception {
@@ -438,11 +565,15 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         try {
             var response = await(client.getKVClient()
                     .get(key("snapshot_pin/"), GetOption.builder().isPrefix(true).build()));
+            List<KeyValue> expired = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
                 IndexCommitSnapshotPin pin = decodeSnapshotPin(item);
                 if (pin.getExpiresAtMillis() <= nowMillis) {
-                    deleteIfCurrent(item);
+                    expired.add(item);
                 }
+            }
+            for (int from = 0; from < expired.size(); from += CAS_CHUNK_SIZE) {
+                deleteKvsIfUnchanged(expired.subList(from, Math.min(from + CAS_CHUNK_SIZE, expired.size())));
             }
         } catch (Exception e) {
             throw storageException("Failed to delete expired commit snapshot pins", e);
@@ -454,11 +585,15 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         try {
             var response = await(client.getKVClient()
                     .get(filePrefix(indexName), GetOption.builder().isPrefix(true).build()));
+            List<KeyValue> matching = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
                 IndexFileMetadata metadata = decodeFileMetadata(item);
                 if (statuses.contains(metadata.getStatus())) {
-                    deleteIfCurrent(item);
+                    matching.add(item);
                 }
+            }
+            for (int from = 0; from < matching.size(); from += CAS_CHUNK_SIZE) {
+                deleteKvsIfUnchanged(matching.subList(from, Math.min(from + CAS_CHUNK_SIZE, matching.size())));
             }
         } catch (Exception e) {
             throw storageException("Failed to delete file metadata by status: " + indexName, e);

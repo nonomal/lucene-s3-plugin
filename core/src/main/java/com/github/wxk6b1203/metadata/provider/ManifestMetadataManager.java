@@ -30,17 +30,20 @@ public abstract class ManifestMetadataManager {
         List<IndexFileMetadata> result = new ArrayList<>(files.size());
         for (IndexFile file : files) {
             IndexFileMetadata existing = fileMetadata(file.indexName(), file.name());
-            if (existing != null) {
+            if (existing != null && sameUpload(existing, file)) {
+                // Same name AND same content: skip only when already durable remotely; otherwise reuse the
+                // existing metadata so the upload state machine (DIRTY -> UPLOADING -> CLEAN) continues.
                 if (existing.getStatus() == IndexFileStatus.CLEAN
                         || existing.getStatus() == IndexFileStatus.PINNED) {
                     result.add(null);
-                    continue;
-                }
-                if (sameUpload(existing, file)) {
+                } else {
                     result.add(existing);
-                    continue;
                 }
+                continue;
             }
+            // Same name but different content (two divergent owner histories colliding on one segment
+            // name after failover) must re-commit with a bumped epoch. Skipping on CLEAN status alone
+            // would keep the stale objectKey published and corrupt readers of the new history line.
             result.add(commitFile(file));
         }
         return result;
@@ -54,6 +57,67 @@ public abstract class ManifestMetadataManager {
     }
 
     public abstract void updateFileStatus(String indexName, String fileName, long epoch, IndexFileStatus status);
+
+    /** A stored file entry together with the store revision, for revision-guarded CAS updates. */
+    public record FileVersion(String fileName, IndexFileMetadata metadata, long modRevision) {
+    }
+
+    /** Outcome of a conditional status flip: whether it applied, and the entry as stored now. */
+    public record StatusFlipOutcome(boolean flipped, FileVersion updated) {
+    }
+
+    /**
+     * Read the given files in one logical call, carrying the store revision so callers can CAS
+     * status transitions without a separate read. The default loops {@link #fileMetadata(String, String)}
+     * with revision {@code -1} (meaning "no revision guard available").
+     */
+    public Map<String, FileVersion> fileVersionsByName(String indexName, java.util.Collection<String> names) {
+        Map<String, FileVersion> result = new HashMap<>();
+        for (String name : names) {
+            IndexFileMetadata metadata = fileMetadata(indexName, name);
+            if (metadata != null) {
+                result.put(name, new FileVersion(name, metadata, -1L));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Conditionally advance the status of one file: the flip applies only when the stored entry
+     * still matches {@code expected} (revision when available, otherwise epoch + transition rule).
+     * The returned {@link FileVersion} reflects the stored entry after the attempt, so callers can
+     * chain further flips without re-reading (null when the entry disappeared).
+     */
+    public StatusFlipOutcome compareAndSetStatus(String indexName, FileVersion expected, IndexFileStatus to) {
+        long epoch = expected.metadata().getEpoch();
+        IndexFileMetadata current = fileMetadata(indexName, expected.fileName());
+        if (current == null) {
+            return new StatusFlipOutcome(false, null);
+        }
+        if (current.getEpoch() != epoch) {
+            return new StatusFlipOutcome(false, new FileVersion(expected.fileName(), current, -1L));
+        }
+        if (current.getStatus() == to) {
+            return new StatusFlipOutcome(true, new FileVersion(expected.fileName(), current, -1L));
+        }
+        updateFileStatus(indexName, expected.fileName(), epoch, to);
+        IndexFileMetadata after = fileMetadata(indexName, expected.fileName());
+        boolean flipped = after != null && after.getStatus() == to && after.getEpoch() == epoch;
+        return new StatusFlipOutcome(flipped, after == null ? null : new FileVersion(expected.fileName(), after, -1L));
+    }
+
+    /** Delete one manifest entry; used by snapshot GC compaction of stale CLEAN history. */
+    public abstract void deleteFile(String indexName, String name);
+
+    /**
+     * Delete multiple manifest entries. The default loops {@link #deleteFile(String, String)};
+     * transactional stores override this to batch the deletions.
+     */
+    public void deleteFiles(String indexName, java.util.Collection<String> names) {
+        for (String name : names) {
+            deleteFile(indexName, name);
+        }
+    }
 
     public abstract List<IndexFileMetadata> listAll(String indexName, List<IndexFileStatus> status);
 
