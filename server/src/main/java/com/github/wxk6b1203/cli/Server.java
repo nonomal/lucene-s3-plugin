@@ -92,6 +92,15 @@ public class Server implements Callable<Integer> {
     @CommandLine.Option(names = {"--s3-secret-key"}, description = "S3 secret key")
     private String s3SecretKey;
 
+    @CommandLine.Option(names = {"--s3-multipart-min-file-size"}, description = "Minimum file size in bytes uploaded via S3 multipart. 0 disables multipart. Default 67108864 (64 MiB).")
+    private long s3MultipartMinFileSizeBytes = 64L * 1024 * 1024;
+
+    @CommandLine.Option(names = {"--s3-multipart-part-size"}, description = "S3 multipart part size in bytes (minimum 5 MiB). Default 8388608 (8 MiB).")
+    private long s3MultipartPartSizeBytes = 8L * 1024 * 1024;
+
+    @CommandLine.Option(names = {"--s3-api-call-timeout"}, description = "Per-attempt S3 API call timeout in seconds. 0 disables the timeout. Default 60.")
+    private int s3ApiCallTimeoutSeconds = 60;
+
     @CommandLine.Option(names = {"--snapshot-retain-latest"}, description = "Number of latest commit snapshot generations retained per shard")
     private int snapshotRetainLatest = 2;
 
@@ -258,7 +267,16 @@ public class Server implements Callable<Integer> {
                         "server.maxBulkBytes", "server.bulk.maxBytes", "server.bulk.max.bytes")),
                 optionValue("--max-http-body-bytes", maxHttpBodyBytes, () -> config.longValue(maxHttpBodyBytes,
                         "maxHttpBodyBytes", "http.maxBodyBytes", "http.max.body.bytes",
-                        "server.maxHttpBodyBytes", "server.http.maxBodyBytes", "server.http.max.body.bytes"))
+                        "server.maxHttpBodyBytes", "server.http.maxBodyBytes", "server.http.max.body.bytes")),
+                optionValue("--s3-multipart-min-file-size", s3MultipartMinFileSizeBytes, () -> config.longValue(s3MultipartMinFileSizeBytes,
+                        "s3MultipartMinFileSizeBytes", "s3.multipart.minFileSize", "s3.multipart.min.file.size",
+                        "server.s3MultipartMinFileSizeBytes", "server.s3.multipart.minFileSize", "server.s3.multipart.min.file.size")),
+                optionValue("--s3-multipart-part-size", s3MultipartPartSizeBytes, () -> config.longValue(s3MultipartPartSizeBytes,
+                        "s3MultipartPartSizeBytes", "s3.multipart.partSize", "s3.multipart.part.size",
+                        "server.s3MultipartPartSizeBytes", "server.s3.multipart.partSize", "server.s3.multipart.part.size")),
+                optionValue("--s3-api-call-timeout", s3ApiCallTimeoutSeconds, () -> config.intValue(s3ApiCallTimeoutSeconds,
+                        "s3ApiCallTimeoutSeconds", "s3.apiCallTimeoutSeconds", "s3.api.call.timeout.seconds",
+                        "server.s3ApiCallTimeoutSeconds", "server.s3.apiCallTimeoutSeconds", "server.s3.api.call.timeout.seconds"))
         );
     }
 

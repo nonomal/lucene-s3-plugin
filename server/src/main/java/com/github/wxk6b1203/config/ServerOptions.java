@@ -39,7 +39,10 @@ public record ServerOptions(
         int maxWriteRequests,
         int maxBulkItems,
         long maxBulkBytes,
-        long maxHttpBodyBytes
+        long maxHttpBodyBytes,
+        long s3MultipartMinFileSizeBytes,
+        long s3MultipartPartSizeBytes,
+        int s3ApiCallTimeoutSeconds
 ) {
     public ServerOptions {
         etcdTimeoutSeconds = Math.max(1, etcdTimeoutSeconds);
@@ -64,6 +67,9 @@ public record ServerOptions(
         maxBulkItems = Math.max(0, maxBulkItems);
         maxBulkBytes = Math.max(0, maxBulkBytes);
         maxHttpBodyBytes = Math.max(0, maxHttpBodyBytes);
+        s3MultipartMinFileSizeBytes = Math.max(0, s3MultipartMinFileSizeBytes);
+        s3MultipartPartSizeBytes = Math.max(5L * 1024 * 1024, s3MultipartPartSizeBytes);
+        s3ApiCallTimeoutSeconds = Math.max(0, s3ApiCallTimeoutSeconds);
     }
 
     public ServerOptions(
@@ -120,7 +126,10 @@ public record ServerOptions(
                 0,
                 0,
                 0,
-                0
+                0,
+                64L * 1024 * 1024,
+                8L * 1024 * 1024,
+                60
         );
     }
 
@@ -179,7 +188,10 @@ public record ServerOptions(
                 0,
                 0,
                 0,
-                0
+                0,
+                64L * 1024 * 1024,
+                8L * 1024 * 1024,
+                60
         );
     }
 
@@ -240,7 +252,10 @@ public record ServerOptions(
                 0,
                 0,
                 0,
-                0
+                0,
+                64L * 1024 * 1024,
+                8L * 1024 * 1024,
+                60
         );
     }
 
@@ -302,7 +317,10 @@ public record ServerOptions(
                 0,
                 0,
                 0,
-                0
+                0,
+                64L * 1024 * 1024,
+                8L * 1024 * 1024,
+                60
         );
     }
 
