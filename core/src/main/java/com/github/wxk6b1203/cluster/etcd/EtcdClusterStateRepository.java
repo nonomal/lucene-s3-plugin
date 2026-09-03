@@ -7,6 +7,7 @@ import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
 import io.etcd.jetcd.Client;
 import io.etcd.jetcd.KeyValue;
+import io.etcd.jetcd.kv.TxnResponse;
 import io.etcd.jetcd.op.Cmp;
 import io.etcd.jetcd.op.CmpTarget;
 import io.etcd.jetcd.op.Op;
@@ -58,9 +59,7 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
     @Override
     public ClusterState current() throws IOException {
         try {
-            KeyValue stateKv = stateKv();
-            ClusterState state = stateKv == null ? emptyState() : decodeState(stateKv);
-            return mergeLiveNodes(state);
+            return readSnapshot().state();
         } catch (Exception e) {
             throw ioException("failed to read cluster state", e);
         }
@@ -70,9 +69,9 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
     public ClusterState update(ClusterStateUpdate update) throws IOException {
         for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
             try {
-                KeyValue currentKv = stateKv();
-                ClusterState current = currentKv == null ? emptyState() : decodeState(currentKv);
-                current = mergeLiveNodes(current);
+                StateSnapshot snapshot = readSnapshot();
+                KeyValue currentKv = snapshot.stateKv();
+                ClusterState current = snapshot.state();
                 ClusterState updated = update.apply(current);
                 if (samePersistentContent(current, updated)) {
                     return current;
@@ -102,6 +101,41 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
         throw new IOException("failed to update cluster state after CAS retries");
     }
 
+    /**
+     * Read the state key and the live-node prefix in ONE read-only transaction: every {@link #current()}
+     * call used to cost two sequential round trips, and it sits on every write's fence check.
+     */
+    private StateSnapshot readSnapshot() throws Exception {
+        TxnResponse response = await(client.getKVClient().txn()
+                .Then(
+                        Op.get(key("state"), io.etcd.jetcd.options.GetOption.DEFAULT),
+                        Op.get(nodesPrefix(), io.etcd.jetcd.options.GetOption.builder().isPrefix(true).build())
+                )
+                .commit());
+        List<KeyValue> stateKvs = response.getGetResponses().getFirst().getKvs();
+        KeyValue stateKv = stateKvs.isEmpty() ? null : stateKvs.getFirst();
+        ClusterState state = stateKv == null ? emptyState() : decodeState(stateKv);
+        Map<String, ClusterNode> nodes = new HashMap<>();
+        for (KeyValue kv : response.getGetResponses().get(1).getKvs()) {
+            ClusterNode node = JsonUtil.readValue(kv.getValue().getBytes(), ClusterNode.class);
+            nodes.put(node.id(), node);
+        }
+        ClusterState merged = new ClusterState(
+                state.clusterName(),
+                state.version(),
+                state.masterNodeId(),
+                nodes,
+                state.indices(),
+                state.routingTable(),
+                state.lifecyclePolicies(),
+                state.updatedAt()
+        );
+        return new StateSnapshot(stateKv, merged);
+    }
+
+    private record StateSnapshot(KeyValue stateKv, ClusterState state) {
+    }
+
     private boolean samePersistentContent(ClusterState left, ClusterState right) {
         return Objects.equals(left.clusterName(), right.clusterName())
                 && Objects.equals(left.masterNodeId(), right.masterNodeId())
@@ -120,31 +154,6 @@ public class EtcdClusterStateRepository implements ClusterStateRepository {
         } catch (Exception e) {
             throw ioException("failed to put node heartbeat", e);
         }
-    }
-
-    private ClusterState mergeLiveNodes(ClusterState state) throws Exception {
-        Map<String, ClusterNode> nodes = new HashMap<>();
-        var response = await(client.getKVClient()
-                .get(nodesPrefix(), GetOption.builder().isPrefix(true).build()));
-        for (KeyValue kv : response.getKvs()) {
-            ClusterNode node = JsonUtil.readValue(kv.getValue().getBytes(), ClusterNode.class);
-            nodes.put(node.id(), node);
-        }
-        return new ClusterState(
-                state.clusterName(),
-                state.version(),
-                state.masterNodeId(),
-                nodes,
-                state.indices(),
-                state.routingTable(),
-                state.lifecyclePolicies(),
-                state.updatedAt()
-        );
-    }
-
-    private KeyValue stateKv() throws Exception {
-        var response = await(client.getKVClient().get(key("state")));
-        return response.getKvs().isEmpty() ? null : response.getKvs().getFirst();
     }
 
     private <T> T await(CompletableFuture<T> future) throws Exception {

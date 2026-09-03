@@ -620,7 +620,10 @@ public class HttpApiServer implements AutoCloseable {
             if (context.request().getHeader(FORWARDED_HEADER) != null) {
                 validateForwardedWriteFence(context, route);
             }
-            validateShardWriteFence(route.shardId(), route.ownerTerm(), route.allocationEpoch());
+            // One live state read per request serves routing, mappings, and the fence; a second
+            // read would double the etcd cost without shrinking the (unavoidable) race window
+            // between the last read and the actual index write.
+            validateShardWriteFence(route.shardId(), route.ownerTerm(), route.allocationEpoch(), state);
             boolean createOnly = "create".equalsIgnoreCase(context.queryParams().get("op_type"));
             IndexDocumentResponse response = localShardIndexService.index(new IndexDocumentRequest(
                     index,
@@ -673,7 +676,7 @@ public class HttpApiServer implements AutoCloseable {
             if (context.request().getHeader(FORWARDED_HEADER) != null) {
                 validateForwardedWriteFence(context, route);
             }
-            validateShardWriteFence(route.shardId(), route.ownerTerm(), route.allocationEpoch());
+            validateShardWriteFence(route.shardId(), route.ownerTerm(), route.allocationEpoch(), state);
             json(context, 200, localShardIndexService.delete(new IndexDocumentRequest(
                     index,
                     route.shardId(),
@@ -902,8 +905,9 @@ public class HttpApiServer implements AutoCloseable {
             Map<String, Object> body = bodyAsMap(context);
             Long ownerTerm = longObject(body.get("owner_term"));
             Long allocationEpoch = longObject(body.get("allocation_epoch"));
-            validateShardWriteFence(shardId, ownerTerm, allocationEpoch);
-            Map<String, FieldMapping> mappings = indexSettings(index, clusterStateRepository.current()).mappings();
+            ClusterState state = clusterStateRepository.current();
+            validateShardWriteFence(shardId, ownerTerm, allocationEpoch, state);
+            Map<String, FieldMapping> mappings = indexSettings(index, state).mappings();
             List<Object> requestItems = objectList(body.get("items"));
             writeBackpressure.validateBulkItemCount(requestItems.size());
             List<BulkItemPlan> plans = new ArrayList<>(requestItems.size());
@@ -1223,7 +1227,7 @@ public class HttpApiServer implements AutoCloseable {
             }
         }
         remoteBatches.forEach((key, plans) -> futures.add(executeRemoteBulkBatch(key, plans)));
-        localBatches.forEach((key, plans) -> futures.add(Future.succeededFuture(executeLocalBulkBatch(key, plans))));
+        localBatches.forEach((key, plans) -> futures.add(Future.succeededFuture(executeLocalBulkBatch(key, plans, state))));
         return futures;
     }
 
@@ -1252,9 +1256,9 @@ public class HttpApiServer implements AutoCloseable {
         return new BulkItemPlan(ordinal, item, id, route, settings.mappings());
     }
 
-    private List<BulkItemResult> executeLocalBulkBatch(BulkShardBatchKey key, List<BulkItemPlan> plans) {
+    private List<BulkItemResult> executeLocalBulkBatch(BulkShardBatchKey key, List<BulkItemPlan> plans, ClusterState state) {
         try {
-            validateShardWriteFence(key.shardId(), key.ownerTerm(), key.allocationEpoch());
+            validateShardWriteFence(key.shardId(), key.ownerTerm(), key.allocationEpoch(), state);
             return executeLocalBulkPlans(plans);
         } catch (Exception e) {
             return plans.stream()
@@ -1361,10 +1365,14 @@ public class HttpApiServer implements AutoCloseable {
     }
 
     private void validateShardWriteFence(ShardId shardId, long ownerTerm, long allocationEpoch) throws IOException {
-        // MUST read live state. The fence detects ownership changes (ownerTerm/allocationEpoch)
-        // that happened since the route was computed; a stale read would make this check a no-op
-        // and allow split-brain writes.
-        ShardRouting routing = routingFor(shardId, clusterStateRepository.current());
+        validateShardWriteFence(shardId, ownerTerm, allocationEpoch, clusterStateRepository.current());
+    }
+
+    private void validateShardWriteFence(ShardId shardId, long ownerTerm, long allocationEpoch, ClusterState state) throws IOException {
+        // MUST be a live state read (or reuse the request's own live read). The fence detects
+        // ownership changes (ownerTerm/allocationEpoch) that happened since the route was computed;
+        // a stale read would make this check a no-op and allow split-brain writes.
+        ShardRouting routing = routingFor(shardId, state);
         if (routing.state() != ShardState.STARTED) {
             throw new IllegalStateException("shard is not writable: " + shardId.routeKey() + " state=" + routing.state());
         }
@@ -1563,9 +1571,9 @@ public class HttpApiServer implements AutoCloseable {
         }
     }
 
-    private Future<ByQueryResponse> executeDeleteByQueryPlan(SearchPlan plan, ByQueryRequest request) {
+    private Future<ByQueryResponse> executeDeleteByQueryPlan(SearchPlan plan, ByQueryRequest request, ClusterState state) {
         List<Future<ByQueryResponse>> futures = plan.targets().stream()
-                .map(target -> executeShardDeleteByQuery(target, request))
+                .map(target -> executeShardDeleteByQuery(target, request, state))
                 .toList();
         if (futures.isEmpty()) {
             return Future.succeededFuture(new ByQueryResponse(null, "delete_by_query", "deleted=0"));
@@ -1581,9 +1589,9 @@ public class HttpApiServer implements AutoCloseable {
                 });
     }
 
-    private Future<ByQueryResponse> executeUpdateByQueryPlan(SearchPlan plan, ByQueryRequest request) {
+    private Future<ByQueryResponse> executeUpdateByQueryPlan(SearchPlan plan, ByQueryRequest request, ClusterState state) {
         List<Future<ByQueryResponse>> futures = plan.targets().stream()
-                .map(target -> executeShardUpdateByQuery(target, request))
+                .map(target -> executeShardUpdateByQuery(target, request, state))
                 .toList();
         if (futures.isEmpty()) {
             return Future.succeededFuture(new ByQueryResponse(null, "update_by_query", "updated=0"));
@@ -1599,11 +1607,11 @@ public class HttpApiServer implements AutoCloseable {
                 });
     }
 
-    private Future<ByQueryResponse> executeShardUpdateByQuery(SearchShardTarget target, ByQueryRequest request) {
+    private Future<ByQueryResponse> executeShardUpdateByQuery(SearchShardTarget target, ByQueryRequest request, ClusterState state) {
         ByQueryRequest fencedRequest = withFence(request, target.ownerTerm(), target.allocationEpoch());
         if (localNode.id().equals(target.nodeId())) {
             try {
-                validateShardWriteFence(target.shardId(), fencedRequest.ownerTerm(), fencedRequest.allocationEpoch());
+                validateShardWriteFence(target.shardId(), fencedRequest.ownerTerm(), fencedRequest.allocationEpoch(), state);
                 return Future.succeededFuture(localShardIndexService.updateByQuery(target.shardId(), fencedRequest));
             } catch (Exception e) {
                 return Future.failedFuture(e);
@@ -1622,11 +1630,11 @@ public class HttpApiServer implements AutoCloseable {
     }
 
 
-    private Future<ByQueryResponse> executeShardDeleteByQuery(SearchShardTarget target, ByQueryRequest request) {
+    private Future<ByQueryResponse> executeShardDeleteByQuery(SearchShardTarget target, ByQueryRequest request, ClusterState state) {
         ByQueryRequest fencedRequest = withFence(request, target.ownerTerm(), target.allocationEpoch());
         if (localNode.id().equals(target.nodeId())) {
             try {
-                validateShardWriteFence(target.shardId(), fencedRequest.ownerTerm(), fencedRequest.allocationEpoch());
+                validateShardWriteFence(target.shardId(), fencedRequest.ownerTerm(), fencedRequest.allocationEpoch(), state);
                 return Future.succeededFuture(localShardIndexService.deleteByQuery(target.shardId(), fencedRequest));
             } catch (Exception e) {
                 return Future.failedFuture(e);
@@ -1697,7 +1705,7 @@ public class HttpApiServer implements AutoCloseable {
                     "owner"
             );
             SearchPlan plan = searchPlanner.plan(searchRequest, state);
-            Future<ByQueryResponse> future = executeUpdateByQueryPlan(plan, request);
+            Future<ByQueryResponse> future = executeUpdateByQueryPlan(plan, request, state);
             async = true;
             future.onSuccess(response -> {
                         try {
@@ -1773,7 +1781,7 @@ public class HttpApiServer implements AutoCloseable {
                     "owner"
             );
             SearchPlan plan = searchPlanner.plan(searchRequest, state);
-            Future<ByQueryResponse> future = executeDeleteByQueryPlan(plan, request);
+            Future<ByQueryResponse> future = executeDeleteByQueryPlan(plan, request, state);
             async = true;
             future.onSuccess(response -> {
                         try {
@@ -2402,15 +2410,13 @@ public class HttpApiServer implements AutoCloseable {
                     cache.put(shardId, false);
                     return false;
                 }
+                // Only pending statuses matter for readiness; decoding the (potentially long)
+                // CLEAN history on every probe is pure etcd load.
                 boolean ready = manifestMetadataManager.listAll(physicalIndexName, List.of(
                                 IndexFileStatus.DIRTY,
-                                IndexFileStatus.UPLOADING,
-                                IndexFileStatus.CLEAN,
-                                IndexFileStatus.PINNED
+                                IndexFileStatus.UPLOADING
                         ))
-                        .stream()
-                        .noneMatch(metadata -> metadata.getStatus() == IndexFileStatus.DIRTY
-                                || metadata.getStatus() == IndexFileStatus.UPLOADING);
+                        .isEmpty();
                 // Cache both outcomes. Readiness is NOT monotonic: a fresh write flips it
                 // true -> false (files become DIRTY/UPLOADING), so a cached true must be
                 // overwritable. Caching false is what preserves read-your-writes for weak reads
