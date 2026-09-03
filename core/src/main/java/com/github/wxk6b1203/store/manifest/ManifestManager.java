@@ -89,6 +89,11 @@ public class ManifestManager implements AutoCloseable {
         return metadataManager.listAll(indexName, statuses);
     }
 
+    /** Full-scan repair of the shard summary; see {@link ManifestMetadataManager#reconcileShardSummary}. */
+    public void reconcileShardSummary(String indexName) {
+        metadataManager.reconcileShardSummary(indexName);
+    }
+
     public IndexFileMetadata fileMetadata(String indexName, String name) throws NoSuchFileException {
         IndexFileMetadata fileMetadata = metadataManager.fileMetadata(indexName, name);
         if (fileMetadata == null) {
@@ -440,37 +445,45 @@ public class ManifestManager implements AutoCloseable {
             if (isSegment != segmentsPhase) {
                 continue;
             }
-            if (upload.version.metadata().getStatus() != IndexFileStatus.DIRTY) {
-                phase.add(upload);
-                continue;
-            }
-            // Mark in flight before the first byte moves; a crash here leaves an UPLOADING
-            // entry that UPLOAD_RETRY recovers, exactly like the previous per-file flow.
-            StatusFlipOutcome outcome = metadataManager.compareAndSetStatus(
-                    indexName, upload.version, IndexFileStatus.UPLOADING);
+            upload.flippedHere = upload.version.metadata().getStatus() == IndexFileStatus.DIRTY;
+            phase.add(upload);
+        }
+        if (phase.isEmpty()) {
+            return true;
+        }
+        // One batched CAS for the whole phase (already-UPLOADING entries are rewritten with their
+        // current value, a no-op that refreshes the chained revision); any stale entry makes the
+        // store fall back to per-entry CAS so outcomes stay exact.
+        List<FileVersion> toFlip = phase.stream()
+                .map(upload -> upload.version)
+                .toList();
+        List<StatusFlipOutcome> outcomes = metadataManager.compareAndSetStatuses(indexName, toFlip, IndexFileStatus.UPLOADING);
+        for (int i = 0; i < phase.size(); i++) {
+            StatusFlipOutcome outcome = outcomes.get(i);
             if (!outcome.flipped()) {
                 log.warn("Failed to mark {}/{} uploading; another writer owns the entry",
-                        indexName, upload.pending.metadata().getName());
+                        indexName, phase.get(i).pending.metadata().getName());
                 return false;
             }
-            upload.version = outcome.updated();
-            upload.flippedHere = true;
-            phase.add(upload);
+            phase.get(i).version = outcome.updated();
         }
         for (ActiveUpload upload : phase) {
             if (!transfer(upload, indexName)) {
                 return false;
             }
         }
-        for (ActiveUpload upload : phase) {
-            StatusFlipOutcome outcome = metadataManager.compareAndSetStatus(
-                    indexName, upload.version, IndexFileStatus.CLEAN);
+        List<FileVersion> cleanVersions = phase.stream()
+                .map(upload -> upload.version)
+                .toList();
+        List<StatusFlipOutcome> cleanOutcomes = metadataManager.compareAndSetStatuses(indexName, cleanVersions, IndexFileStatus.CLEAN);
+        for (int i = 0; i < phase.size(); i++) {
+            StatusFlipOutcome outcome = cleanOutcomes.get(i);
             if (!outcome.flipped()) {
                 log.warn("Failed to mark {}/{} clean; publish retries on the next maintenance tick",
-                        indexName, upload.pending.metadata().getName());
+                        indexName, phase.get(i).pending.metadata().getName());
                 return false;
             }
-            upload.version = outcome.updated();
+            phase.get(i).version = outcome.updated();
         }
         return true;
     }

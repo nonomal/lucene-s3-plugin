@@ -6,6 +6,7 @@ import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
@@ -89,7 +90,31 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         file.modifiedTime(),
                         IndexFileStatus.DIRTY
                 );
-                if (putIfCurrent(key, currentKv, metadata)) {
+                // The summary increment rides in the same transaction as the file write so the
+                // pending count cannot drift from the entries it counts.
+                boolean alreadyPending = current != null
+                        && (current.getStatus() == IndexFileStatus.DIRTY
+                                || current.getStatus() == IndexFileStatus.UPLOADING);
+                SummaryVersion summary = summaryVersion(file.indexName());
+                ShardSummary base = summary.summary() == null ? ShardSummary.empty() : summary.summary();
+                ShardSummary updatedSummary = new ShardSummary(
+                        base.pendingCount() + (alreadyPending ? 0 : 1),
+                        base.latestGeneration(),
+                        System.currentTimeMillis());
+                ByteSequence summaryKey = shardStateKey(file.indexName());
+                TxnResponse response = await(client.getKVClient().txn()
+                        .If(
+                                currentKv == null
+                                        ? new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
+                                        : new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(currentKv.getModRevision())),
+                                summaryGuard(summaryKey, summary)
+                        )
+                        .Then(
+                                Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(metadata)), PutOption.DEFAULT),
+                                Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updatedSummary)), PutOption.DEFAULT)
+                        )
+                        .commit());
+                if (response.isSucceeded()) {
                     return metadata;
                 }
             } catch (Exception e) {
@@ -122,6 +147,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                     fileNames.add(file.name());
                 }
                 Map<String, KeyValue> current = fileKvsByNames(indexName, fileNames);
+                SummaryVersion summary = summaryVersion(indexName);
                 List<IndexFileMetadata> result = new ArrayList<>(files.size());
                 List<BatchCommitEntry> toCommit = new ArrayList<>();
                 for (IndexFile file : files) {
@@ -167,7 +193,11 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                 boolean allApplied = true;
                 for (int from = 0; from < toCommit.size(); from += CAS_CHUNK_SIZE) {
                     int to = Math.min(from + CAS_CHUNK_SIZE, toCommit.size());
-                    if (!putAllIfCurrent(toCommit.subList(from, to))) {
+                    boolean lastChunk = to == toCommit.size();
+                    // The pending-count increment rides on the last chunk's transaction so the
+                    // shard summary moves atomically with the files it counts.
+                    if (!putAllIfCurrent(toCommit.subList(from, to),
+                            lastChunk ? summary : null, toCommit.size())) {
                         allApplied = false;
                         break;
                     }
@@ -181,6 +211,60 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
             }
         }
         throw new StorageException("Failed to commit file metadata batch after CAS retries: " + indexName);
+    }
+
+    @Override
+    public ShardSummary shardSummary(String indexName) {
+        try {
+            return summaryVersion(indexName).summary();
+        } catch (Exception e) {
+            throw storageException("Failed to read shard summary: " + indexName, e);
+        }
+    }
+
+    @Override
+    public void putShardSummary(String indexName, ShardSummary summary) {
+        try {
+            await(client.getKVClient().put(shardStateKey(indexName),
+                    ByteSequence.from(JsonUtil.writeValueAsBytes(summary))));
+        } catch (Exception e) {
+            throw storageException("Failed to write shard summary: " + indexName, e);
+        }
+    }
+
+    @Override
+    public Map<String, ShardSummary> shardSummaries() {
+        try {
+            var response = await(client.getKVClient()
+                    .get(shardStatePrefix(), GetOption.builder().isPrefix(true).build()));
+            Map<String, ShardSummary> result = new HashMap<>();
+            for (KeyValue kv : response.getKvs()) {
+                String key = kv.getKey().toString(StandardCharsets.UTF_8);
+                String marker = namespace + "/shard_state/";
+                if (!key.startsWith(marker)) {
+                    continue;
+                }
+                result.put(key.substring(marker.length()), decodeSummary(kv));
+            }
+            return result;
+        } catch (Exception e) {
+            throw storageException("Failed to list shard summaries", e);
+        }
+    }
+
+    private ShardSummary decodeSummary(KeyValue kv) {
+        return JsonUtil.readValue(kv.getValue().getBytes(), ShardSummary.class);
+    }
+
+    private SummaryVersion summaryVersion(String indexName) throws Exception {
+        KeyValue kv = fileKv(shardStateKey(indexName));
+        return kv == null
+                ? new SummaryVersion(null, 0)
+                : new SummaryVersion(decodeSummary(kv), kv.getModRevision());
+    }
+
+    /** Stored shard summary together with its revision for CAS guards (revision 0 = absent). */
+    private record SummaryVersion(ShardSummary summary, long modRevision) {
     }
 
     @Override
@@ -214,19 +298,9 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                     }
                 }
                 IndexFileMetadata updated = copyWithStatus(current.metadata(), to);
-                TxnResponse response = await(client.getKVClient().txn()
-                        .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(current.modRevision())))
-                        .Then(
-                                Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(updated)), PutOption.DEFAULT),
-                                Op.get(key, GetOption.DEFAULT)
-                        )
-                        .Else(Op.get(key, GetOption.DEFAULT))
-                        .commit());
-                // jetcd's TxnResponse.getGetResponses() only contains responses for get ops (puts
-                // are omitted), so the single Op.get sits at index 0 in both branches.
-                List<GetResponse> getResponses = response.getGetResponses();
-                List<KeyValue> afterKvs = getResponses.getFirst().getKvs();
-                KeyValue afterKv = afterKvs.isEmpty() ? null : afterKvs.getFirst();
+                TxnResponse response = flipTxn(indexName, key, current.modRevision(),
+                        ByteSequence.from(JsonUtil.writeValueAsBytes(updated)), to == IndexFileStatus.CLEAN);
+                KeyValue afterKv = extractFlipGet(response);
                 if (response.isSucceeded()) {
                     FileVersion updatedVersion = afterKv == null
                             ? null
@@ -251,6 +325,127 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
         throw new StorageException("Failed to flip file status after CAS retries: "
                 + indexName + "/" + expected.fileName());
+    }
+
+    @Override
+    public List<StatusFlipOutcome> compareAndSetStatuses(String indexName, List<FileVersion> expected, IndexFileStatus to) {
+        if (expected.isEmpty()) {
+            return List.of();
+        }
+        List<StatusFlipOutcome> results = new ArrayList<>(expected.size());
+        // 3 ops per entry (Cmp + Put + Get); 2 ops are the minimum for a guarded write, so 42
+        // entries fill etcd's 128-op transaction budget.
+        int chunkSize = MAX_TXN_OPS / 3;
+        for (int from = 0; from < expected.size(); from += chunkSize) {
+            List<FileVersion> chunk = expected.subList(from, Math.min(from + chunkSize, expected.size()));
+            List<StatusFlipOutcome> chunkResults = flipChunk(indexName, chunk, to);
+            results.addAll(chunkResults);
+            if (chunkResults.stream().anyMatch(outcome -> !outcome.flipped())) {
+                // The chunk txn is all-or-nothing: one stale entry rejects the whole chunk and
+                // nothing was applied. Fall back to per-entry CAS (which self-maintains the shard
+                // summary) so each outcome is exact for its own entry.
+                for (int i = 0; i < chunk.size(); i++) {
+                    if (!chunkResults.get(i).flipped()) {
+                        results.set(from + i, compareAndSetStatus(indexName, chunk.get(i), to));
+                    }
+                }
+            }
+        }
+        return results;
+    }
+
+    /** All-or-nothing chunk: one txn guards every entry and updates the shard summary once. */
+    private List<StatusFlipOutcome> flipChunk(String indexName, List<FileVersion> chunk, IndexFileStatus to) {
+        try {
+            SummaryVersion summary = summaryVersion(indexName);
+            ShardSummary updatedSummary = summaryAfterFlip(summary.summary(), to, chunk.size());
+
+            ByteSequence summaryKey = shardStateKey(indexName);
+            List<Cmp> cmps = new ArrayList<>(chunk.size() + 1);
+            List<Op> ops = new ArrayList<>(chunk.size() * 2 + 1);
+            cmps.add(summaryGuard(summaryKey, summary));
+            for (FileVersion version : chunk) {
+                ByteSequence key = fileKey(indexName, version.fileName());
+                cmps.add(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(version.modRevision())));
+                ops.add(Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(copyWithStatus(version.metadata(), to))), PutOption.DEFAULT));
+                ops.add(Op.get(key, GetOption.DEFAULT));
+            }
+            ops.add(Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updatedSummary)), PutOption.DEFAULT));
+
+            TxnResponse response = await(client.getKVClient().txn().If(cmps.toArray(Cmp[]::new)).Then(ops.toArray(Op[]::new)).commit());
+            List<StatusFlipOutcome> outcomes = new ArrayList<>(chunk.size());
+            // getGetResponses holds one response per Op.get in order, each carrying the post-write
+            // value and its fresh revision for chained flips.
+            List<GetResponse> gets = response.getGetResponses();
+            boolean succeeded = response.isSucceeded() && gets.size() == chunk.size();
+            for (int i = 0; i < chunk.size(); i++) {
+                if (!succeeded) {
+                    outcomes.add(new StatusFlipOutcome(false, null));
+                    continue;
+                }
+                List<KeyValue> kvs = gets.get(i).getKvs();
+                KeyValue afterKv = kvs.isEmpty() ? null : kvs.getFirst();
+                outcomes.add(new StatusFlipOutcome(true, afterKv == null
+                        ? null
+                        : new FileVersion(chunk.get(i).fileName(), decodeFileMetadata(afterKv), afterKv.getModRevision())));
+            }
+            return outcomes;
+        } catch (Exception e) {
+            throw storageException("Failed to flip file statuses: " + indexName, e);
+        }
+    }
+
+    /**
+     * Guarded write of one file status plus the shard summary delta (one fewer pending file when
+     * the transition lands CLEAN), both in a single transaction.
+     */
+    private TxnResponse flipTxn(String indexName,
+                                ByteSequence key,
+                                long expectedModRevision,
+                                ByteSequence updatedValue,
+                                boolean decrementPending) throws Exception {
+        SummaryVersion summary = summaryVersion(indexName);
+        ShardSummary updatedSummary = summaryAfterFlip(summary.summary(),
+                decrementPending ? IndexFileStatus.CLEAN : IndexFileStatus.UPLOADING, 1);
+        ByteSequence summaryKey = shardStateKey(indexName);
+        return await(client.getKVClient().txn()
+                .If(
+                        new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(expectedModRevision)),
+                        summaryGuard(summaryKey, summary)
+                )
+                .Then(
+                        Op.put(key, updatedValue, PutOption.DEFAULT),
+                        Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updatedSummary)), PutOption.DEFAULT),
+                        Op.get(key, GetOption.DEFAULT)
+                )
+                .Else(Op.get(key, GetOption.DEFAULT))
+                .commit());
+    }
+
+    /** Summary CAS guard: mod-revision match for existing keys, version-0 (absent) otherwise. */
+    private Cmp summaryGuard(ByteSequence summaryKey, SummaryVersion summary) {
+        return summary.modRevision() > 0
+                ? new Cmp(summaryKey, Cmp.Op.EQUAL, CmpTarget.modRevision(summary.modRevision()))
+                : new Cmp(summaryKey, Cmp.Op.EQUAL, CmpTarget.version(0));
+    }
+
+    private ShardSummary summaryAfterFlip(ShardSummary summary, IndexFileStatus to, int count) {
+        ShardSummary base = summary == null ? ShardSummary.empty() : summary;
+        int pending = base.pendingCount();
+        if (to == IndexFileStatus.CLEAN) {
+            // DIRTY -> UPLOADING keeps the count: files were already counted pending when
+            // committed. Only landing CLEAN retires them from the pending total.
+            pending = Math.max(0, pending - count);
+        }
+        return new ShardSummary(pending, base.latestGeneration(), System.currentTimeMillis());
+    }
+
+    private KeyValue extractFlipGet(TxnResponse response) {
+        // jetcd's TxnResponse.getGetResponses() only contains responses for get ops (puts are
+        // omitted), so the single Op.get sits at index 0 in both branches.
+        List<GetResponse> getResponses = response.getGetResponses();
+        List<KeyValue> afterKvs = getResponses.getFirst().getKvs();
+        return afterKvs.isEmpty() ? null : afterKvs.getFirst();
     }
 
     private IndexFileMetadata copyWithStatus(IndexFileMetadata metadata, IndexFileStatus status) {
@@ -354,18 +549,28 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
         }
     }
 
-    private boolean putAllIfCurrent(List<BatchCommitEntry> entries) throws Exception {
-        Cmp[] cmps = new Cmp[entries.size()];
-        Op[] ops = new Op[entries.size()];
+    private boolean putAllIfCurrent(List<BatchCommitEntry> entries, SummaryVersion summary, int pendingDelta) throws Exception {
+        ByteSequence summaryKey = shardStateKey(entries.getFirst().file.indexName());
+        Cmp[] cmps = new Cmp[entries.size() + (summary == null ? 0 : 1)];
+        List<Op> ops = new ArrayList<>(entries.size() + 1);
         for (int i = 0; i < entries.size(); i++) {
             BatchCommitEntry entry = entries.get(i);
             ByteSequence key = fileKey(entry.file.indexName(), entry.file.name());
             cmps[i] = entry.currentKv == null
                     ? new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0))
                     : new Cmp(key, Cmp.Op.EQUAL, CmpTarget.modRevision(entry.currentKv.getModRevision()));
-            ops[i] = Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(entry.metadata)), PutOption.DEFAULT);
+            ops.add(Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(entry.metadata)), PutOption.DEFAULT));
         }
-        return await(client.getKVClient().txn().If(cmps).Then(ops).commit()).isSucceeded();
+        if (summary != null) {
+            ShardSummary base = summary.summary() == null ? ShardSummary.empty() : summary.summary();
+            ShardSummary updated = new ShardSummary(
+                    base.pendingCount() + pendingDelta,
+                    base.latestGeneration(),
+                    System.currentTimeMillis());
+            cmps[entries.size()] = summaryGuard(summaryKey, summary);
+            ops.add(Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updated)), PutOption.DEFAULT));
+        }
+        return await(client.getKVClient().txn().If(cmps).Then(ops.toArray(Op[]::new)).commit()).isSucceeded();
     }
 
     private boolean sameUpload(IndexFileMetadata metadata, IndexFile file) {
@@ -447,10 +652,23 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         System.currentTimeMillis()
                 );
                 ByteSequence key = snapshotKey(indexName, generation);
+                SummaryVersion summary = summaryVersion(indexName);
+                ShardSummary updatedSummary = new ShardSummary(
+                        summary.summary() == null ? 0 : summary.summary().pendingCount(),
+                        generation,
+                        System.currentTimeMillis()
+                );
+                ByteSequence summaryKey = shardStateKey(indexName);
                 boolean created = await(client.getKVClient()
                         .txn()
-                        .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0)))
-                        .Then(Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(snapshot)), PutOption.DEFAULT))
+                        .If(
+                                new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0)),
+                                summaryGuard(summaryKey, summary)
+                        )
+                        .Then(
+                                Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(snapshot)), PutOption.DEFAULT),
+                                Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updatedSummary)), PutOption.DEFAULT)
+                        )
                         .commit())
                         .isSucceeded();
                 if (created) {
@@ -595,6 +813,22 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
             for (int from = 0; from < matching.size(); from += CAS_CHUNK_SIZE) {
                 deleteKvsIfUnchanged(matching.subList(from, Math.min(from + CAS_CHUNK_SIZE, matching.size())));
             }
+            if (matching.isEmpty()) {
+                return;
+            }
+            boolean removedPending = statuses.contains(IndexFileStatus.DIRTY)
+                    || statuses.contains(IndexFileStatus.UPLOADING);
+            if (removedPending) {
+                // discardPendingUploads removed every pending entry; record an exact zero so the
+                // summary cannot keep readiness pinned to owner-only reads.
+                SummaryVersion summary = summaryVersion(indexName);
+                ShardSummary base = summary.summary() == null ? ShardSummary.empty() : summary.summary();
+                await(client.getKVClient().txn()
+                        .If(summaryGuard(shardStateKey(indexName), summary))
+                        .Then(Op.put(shardStateKey(indexName), ByteSequence.from(JsonUtil.writeValueAsBytes(
+                                new ShardSummary(0, base.latestGeneration(), System.currentTimeMillis()))), PutOption.DEFAULT))
+                        .commit());
+            }
         } catch (Exception e) {
             throw storageException("Failed to delete file metadata by status: " + indexName, e);
         }
@@ -609,6 +843,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                     .delete(snapshotPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
             await(client.getKVClient()
                     .delete(pinPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
+            await(client.getKVClient()
+                    .delete(shardStateKey(indexName)));
         } catch (Exception e) {
             throw storageException("Failed to delete file metadata: " + indexName, e);
         }
@@ -689,6 +925,14 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
 
     private ByteSequence pinKey(String indexName, String pinId) {
         return key("snapshot_pin/" + indexName + "/" + pinId);
+    }
+
+    private ByteSequence shardStateKey(String indexName) {
+        return key("shard_state/" + indexName);
+    }
+
+    private ByteSequence shardStatePrefix() {
+        return key("shard_state/");
     }
 
     private ByteSequence key(String suffix) {

@@ -7,6 +7,7 @@ import com.github.wxk6b1203.cluster.ShardId;
 import com.github.wxk6b1203.cluster.ShardState;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.search.*;
 import com.github.wxk6b1203.store.common.PathUtil;
@@ -925,6 +926,11 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                     try (S3CachingDirectory directory = openShardDirectory(shardId, remoteSnapshotStatuses())) {
                         directory.publishLocalCommit();
                     }
+                    // Orphaned shard repaired: recompute the summary from a full scan so a drifted
+                    // counter cannot pin readiness to owner-only reads forever.
+                    try (ManifestManager manifestManager = openManifestManager()) {
+                        manifestManager.reconcileShardSummary(physicalIndexName(shardId));
+                    }
                 }
             } catch (IOException e) {
                 failure = addFailure(failure, e);
@@ -953,6 +959,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
     }
 
     private boolean hasPendingUploads(ShardId shardId) {
+        // Summary key is the fast path (one GET); fall back to the authoritative scan when the
+        // shard has no summary yet (legacy data or fresh namespace).
+        ShardSummary summary = metadataManager.shardSummary(physicalIndexName(shardId));
+        if (summary != null) {
+            return summary.pendingCount() > 0;
+        }
         return !metadataManager.listAll(physicalIndexName(shardId), List.of(
                 IndexFileStatus.DIRTY,
                 IndexFileStatus.UPLOADING

@@ -5,6 +5,7 @@ import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -106,8 +107,50 @@ public abstract class ManifestMetadataManager {
         return new StatusFlipOutcome(flipped, after == null ? null : new FileVersion(expected.fileName(), after, -1L));
     }
 
+    /**
+     * Flip a batch of files in one logical call. Entries whose stored revision no longer matches
+     * are reported as not flipped; the store is free to fall back to per-entry CAS so the outcome
+     * for each entry is exact.
+     */
+    public List<StatusFlipOutcome> compareAndSetStatuses(String indexName, List<FileVersion> expected, IndexFileStatus to) {
+        List<StatusFlipOutcome> results = new ArrayList<>(expected.size());
+        for (FileVersion version : expected) {
+            results.add(compareAndSetStatus(indexName, version, to));
+        }
+        return results;
+    }
+
     /** Delete one manifest entry; used by snapshot GC compaction of stale CLEAN history. */
     public abstract void deleteFile(String indexName, String name);
+
+    /**
+     * Per-shard aggregate (pending count + latest snapshot generation) used by readiness probes
+     * and retry ticks instead of full file-history scans. Returns null when no summary exists.
+     */
+    public abstract ShardSummary shardSummary(String indexName);
+
+    /** Overwrite the shard summary; used by the full-scan repair below and by tests. */
+    public abstract void putShardSummary(String indexName, ShardSummary summary);
+
+    /** Read summaries for all shards in one logical call; default loops {@link #shardSummary}. */
+    public java.util.Map<String, ShardSummary> shardSummaries() {
+        return java.util.Map.of();
+    }
+
+    /**
+     * Recompute the summary from a full scan. The transactional maintenance above cannot drift
+     * from the file entries it counts, so this is a repair path for legacy shards (no summary yet)
+     * and a safety net, not a hot-path dependency.
+     */
+    public void reconcileShardSummary(String indexName) {
+        int pending = listAll(indexName, List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).size();
+        IndexCommitSnapshot snapshot = latestSnapshot(indexName);
+        putShardSummary(indexName, new ShardSummary(
+                pending,
+                snapshot == null ? 0 : snapshot.getGeneration(),
+                System.currentTimeMillis()
+        ));
+    }
 
     /**
      * Delete multiple manifest entries. The default loops {@link #deleteFile(String, String)};

@@ -2,6 +2,7 @@ package com.github.wxk6b1203.metadata.provider;
 
 import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.etcd.EtcdManifestMetadataManager;
 import io.etcd.jetcd.Client;
 import org.junit.jupiter.api.Test;
@@ -115,6 +116,81 @@ public class EtcdManifestMetadataManagerTest {
             var gone = provider.compareAndSetStatus("books__shard_0", stale, IndexFileStatus.UPLOADING);
             assertFalse(gone.flipped());
             assertNull(gone.updated());
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    public void compareAndSetStatusesReportsExactPerEntryOutcomes() {
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        String namespace = "test-manifest/" + UUID.randomUUID();
+        EtcdManifestMetadataManager provider = new EtcdManifestMetadataManager(
+                EtcdManifestMetadataManager.Options.builder().namespace(namespace).build(), client);
+        try {
+            provider.commitFile(new IndexFile("books__shard_0", "_0.si", 128, 7));
+            provider.commitFile(new IndexFile("books__shard_0", "segments_1", 64, 3));
+            var fresh = provider.fileVersionsByName("books__shard_0", List.of("_0.si", "segments_1"));
+
+            var outcomes = provider.compareAndSetStatuses("books__shard_0",
+                    List.of(fresh.get("_0.si"), fresh.get("segments_1")), IndexFileStatus.UPLOADING);
+            assertTrue(outcomes.stream().allMatch(outcome -> outcome.flipped()));
+            assertTrue(outcomes.stream().allMatch(outcome -> outcome.updated() != null
+                    && outcome.updated().metadata().getStatus() == IndexFileStatus.UPLOADING));
+
+            // Re-commit one file with different content; a batch flip carrying the stale version
+            // must report that entry as not flipped while still flipping the valid one.
+            provider.commitFile(new IndexFile("books__shard_0", "_0.si", 256, 9));
+            outcomes = provider.compareAndSetStatuses("books__shard_0",
+                    List.of(fresh.get("_0.si"), fresh.get("segments_1")), IndexFileStatus.CLEAN);
+            assertFalse(outcomes.get(0).flipped());
+            assertTrue(outcomes.get(1).flipped());
+            assertEquals(IndexFileStatus.CLEAN, provider.fileMetadata("books__shard_0", "segments_1").getStatus());
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    public void maintainsShardPendingSummaryAndRepairsDrift() {
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        String namespace = "test-manifest/" + UUID.randomUUID();
+        EtcdManifestMetadataManager provider = new EtcdManifestMetadataManager(
+                EtcdManifestMetadataManager.Options.builder().namespace(namespace).build(), client);
+        try {
+            assertNull(provider.shardSummary("books__shard_0"));
+
+            provider.commitFile(new IndexFile("books__shard_0", "_0.si", 128, 7));
+            provider.commitFile(new IndexFile("books__shard_0", "segments_1", 64, 3));
+            assertEquals(2, provider.shardSummary("books__shard_0").pendingCount());
+
+            var versions = provider.fileVersionsByName("books__shard_0", List.of("_0.si", "segments_1"));
+            var outcomes = provider.compareAndSetStatuses("books__shard_0",
+                    List.of(versions.get("_0.si"), versions.get("segments_1")), IndexFileStatus.UPLOADING);
+            assertTrue(outcomes.stream().allMatch(outcome -> outcome.flipped()));
+            assertEquals(2, provider.shardSummary("books__shard_0").pendingCount(),
+                    "UPLOADING files are still pending");
+
+            provider.compareAndSetStatuses("books__shard_0",
+                    List.of(outcomes.get(0).updated(), outcomes.get(1).updated()), IndexFileStatus.CLEAN);
+            assertEquals(0, provider.shardSummary("books__shard_0").pendingCount());
+
+            long generation = provider.publishSnapshot("books__shard_0", "segments_1", List.of(
+                    provider.fileMetadata("books__shard_0", "_0.si"),
+                    provider.fileMetadata("books__shard_0", "segments_1")));
+            assertEquals(generation, provider.shardSummary("books__shard_0").latestGeneration());
+
+            // Full-scan repair restores a wiped or drifted summary.
+            provider.putShardSummary("books__shard_0", new ShardSummary(99, 0, 0));
+            provider.reconcileShardSummary("books__shard_0");
+            ShardSummary repaired = provider.shardSummary("books__shard_0");
+            assertEquals(0, repaired.pendingCount());
+            assertEquals(generation, repaired.latestGeneration());
+
+            provider.deleteAll("books__shard_0");
+            assertNull(provider.shardSummary("books__shard_0"));
         } finally {
             client.close();
         }

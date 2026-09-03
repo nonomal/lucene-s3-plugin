@@ -5,12 +5,15 @@ import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
+import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -18,6 +21,7 @@ public class MemMockProvider extends ManifestMetadataManager {
     private final ConcurrentHashMap<String, IndexFileMetadata> files = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, IndexCommitSnapshot> snapshots = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, IndexCommitSnapshotPin> pins = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ShardSummary> shardSummaries = new ConcurrentHashMap<>();
 
     private String keyName(IndexFile indexFile) {
         return indexFile.indexName() + "/" + indexFile.name();
@@ -44,7 +48,24 @@ public class MemMockProvider extends ManifestMetadataManager {
                 IndexFileStatus.DIRTY
         );
         files.put(key, metadata);
+        bumpPending(file.indexName(), existing == null || !isPending(existing) ? 1 : 0);
         return metadata;
+    }
+
+    private boolean isPending(IndexFileMetadata metadata) {
+        return metadata.getStatus() == IndexFileStatus.DIRTY
+                || metadata.getStatus() == IndexFileStatus.UPLOADING;
+    }
+
+    private void bumpPending(String indexName, int delta) {
+        if (delta == 0) {
+            return;
+        }
+        ShardSummary base = shardSummaries.getOrDefault(indexName, ShardSummary.empty());
+        shardSummaries.put(indexName, new ShardSummary(
+                Math.max(0, base.pendingCount() + delta),
+                base.latestGeneration(),
+                System.currentTimeMillis()));
     }
 
     @Override
@@ -57,7 +78,28 @@ public class MemMockProvider extends ManifestMetadataManager {
             log.error("Invalid status transition from {} to {}", metadata.getStatus(), status);
             return;
         }
+        boolean wasPending = isPending(metadata);
         metadata.setStatus(status);
+        if (wasPending && !isPending(metadata)) {
+            bumpPending(indexName, -1);
+        } else if (!wasPending && isPending(metadata)) {
+            bumpPending(indexName, 1);
+        }
+    }
+
+    @Override
+    public synchronized ShardSummary shardSummary(String indexName) {
+        return shardSummaries.get(indexName);
+    }
+
+    @Override
+    public synchronized void putShardSummary(String indexName, ShardSummary summary) {
+        shardSummaries.put(indexName, summary);
+    }
+
+    @Override
+    public synchronized Map<String, ShardSummary> shardSummaries() {
+        return new HashMap<>(shardSummaries);
     }
 
     @Override
@@ -89,6 +131,9 @@ public class MemMockProvider extends ManifestMetadataManager {
                 System.currentTimeMillis()
         );
         snapshots.put(snapshotKey(indexName, generation), snapshot);
+        ShardSummary base = shardSummaries.getOrDefault(indexName, ShardSummary.empty());
+        shardSummaries.put(indexName, new ShardSummary(
+                base.pendingCount(), generation, System.currentTimeMillis()));
         return generation;
     }
 
@@ -145,7 +190,10 @@ public class MemMockProvider extends ManifestMetadataManager {
 
     @Override
     public synchronized void deleteFile(String indexName, String name) {
-        files.remove(keyName(indexName, name));
+        IndexFileMetadata removed = files.remove(keyName(indexName, name));
+        if (removed != null && isPending(removed)) {
+            bumpPending(indexName, -1);
+        }
     }
 
     @Override
@@ -153,6 +201,10 @@ public class MemMockProvider extends ManifestMetadataManager {
         String prefix = indexName + "/";
         files.entrySet().removeIf(entry -> entry.getKey().startsWith(prefix)
                 && statuses.contains(entry.getValue().getStatus()));
+        if (statuses.contains(IndexFileStatus.DIRTY) || statuses.contains(IndexFileStatus.UPLOADING)) {
+            ShardSummary base = shardSummaries.getOrDefault(indexName, ShardSummary.empty());
+            shardSummaries.put(indexName, new ShardSummary(0, base.latestGeneration(), System.currentTimeMillis()));
+        }
     }
 
     @Override
@@ -161,6 +213,7 @@ public class MemMockProvider extends ManifestMetadataManager {
         files.keySet().removeIf(key -> key.startsWith(prefix));
         snapshots.keySet().removeIf(key -> key.startsWith(prefix));
         pins.keySet().removeIf(key -> key.startsWith(prefix));
+        shardSummaries.keySet().removeIf(key -> key.equals(indexName));
     }
 
     private String snapshotKey(String indexName, long generation) {
