@@ -1,12 +1,16 @@
 package com.github.wxk6b1203.index;
 
+import com.github.wxk6b1203.cluster.ClusterState;
 import com.github.wxk6b1203.cluster.FieldMapping;
+import com.github.wxk6b1203.cluster.IndexSettings;
 import com.github.wxk6b1203.cluster.ShardId;
+import com.github.wxk6b1203.cluster.ShardState;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.search.*;
 import com.github.wxk6b1203.store.common.PathUtil;
+import com.github.wxk6b1203.store.directory.Hierarchy;
 import com.github.wxk6b1203.store.directory.S3CachingDirectory;
 import com.github.wxk6b1203.store.directory.S3DirectoryOptions;
 import com.github.wxk6b1203.store.directory.S3LockFactory;
@@ -55,6 +59,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
     private final LuceneAggregationExecutor aggregationExecutor = new LuceneAggregationExecutor();
     private final ConcurrentMap<ShardId, Map<String, FieldMapping>> mappingsByShard = new ConcurrentHashMap<>();
     private final Map<ShardId, ShardWriter> writers = new ConcurrentHashMap<>();
+    private final Set<ShardId> retiringShards = ConcurrentHashMap.newKeySet();
     private final Map<RemoteSearcherKey, CachedRemoteSearcher> remoteSearchers = new ConcurrentHashMap<>();
     private final Map<String, PitContext> pits = new ConcurrentHashMap<>();
 
@@ -906,6 +911,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                                     }
                                     if (Boolean.TRUE.equals(published)) {
                                         markLatestSnapshotPublished(shardWriter);
+                                        shardWriter.snapshotPublishPending.set(false);
                                         releaseReclaimableSnapshotCommits(shardWriter);
                                     }
                                 });
@@ -954,6 +960,212 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
     }
 
     @Override
+    public void reconcileWithClusterState(ClusterState state, String expectedOwnerNodeId) throws IOException {
+        if (!retiringShards.isEmpty()) {
+            // Previous reconcile round still draining; retry on the next tick.
+            return;
+        }
+        IOException failure = null;
+        for (Map.Entry<ShardId, ShardWriter> entry : List.copyOf(writers.entrySet())) {
+            ShardId shardId = entry.getKey();
+            RetirePlan plan = retirePlan(state, shardId, expectedOwnerNodeId);
+            if (plan == RetirePlan.NONE || !retiringShards.add(shardId)) {
+                continue;
+            }
+            try {
+                if (plan == RetirePlan.QUARANTINE_ONLY) {
+                    // Index deleted or pending deletion: the master reclaims remote data; keep no local lineage.
+                    synchronized (entry.getValue()) {
+                        closePitsFor(shardId);
+                        if (writers.remove(shardId, entry.getValue())) {
+                            entry.getValue().close();
+                        }
+                    }
+                    quarantineShardDirectories(shardId);
+                } else {
+                    retireShardWriter(shardId);
+                }
+            } catch (IOException e) {
+                failure = addFailure(failure, e);
+            } finally {
+                retiringShards.remove(shardId);
+            }
+        }
+        for (ShardId shardId : localWalShardIds()) {
+            if (writers.containsKey(shardId)
+                    || retirePlan(state, shardId, expectedOwnerNodeId) == RetirePlan.NONE
+                    || !retiringShards.add(shardId)) {
+                continue;
+            }
+            try {
+                drainAndQuarantine(shardId, true);
+            } catch (IOException e) {
+                failure = addFailure(failure, e);
+            } finally {
+                retiringShards.remove(shardId);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private enum RetirePlan {
+        NONE,
+        DRAIN,
+        QUARANTINE_ONLY
+    }
+
+    private RetirePlan retirePlan(ClusterState state, ShardId shardId, String expectedOwnerNodeId) {
+        IndexSettings settings = state.indices().get(shardId.indexName());
+        if (settings == null || settings.deletePending()) {
+            return RetirePlan.QUARANTINE_ONLY;
+        }
+        boolean owned = state.routingTable().stream()
+                .filter(routing -> routing.shardId().equals(shardId))
+                .findFirst()
+                .map(routing -> routing.state() == ShardState.STARTED
+                        && expectedOwnerNodeId.equals(routing.nodeId()))
+                .orElse(false);
+        return owned ? RetirePlan.NONE : RetirePlan.DRAIN;
+    }
+
+    @Override
+    public void retireShardWriter(ShardId shardId) throws IOException {
+        ShardWriter shardWriter = writers.get(shardId);
+        if (shardWriter == null) {
+            drainAndQuarantine(shardId, true);
+            return;
+        }
+        synchronized (shardWriter) {
+            // 1) Flush acknowledged-but-uncommitted operations to local WAL (fsync only, no manifest publish).
+            if (shardWriter.uncommittedOperations.get() > 0) {
+                shardWriter.writer.commit();
+                shardWriter.uncommittedOperations.set(0);
+                shardWriter.lastCommitNanos.set(System.nanoTime());
+            }
+            // 2) Drain committed content to S3. Upload only: publishing here would interleave a
+            // divergent segment line into the snapshot sequence owned by the new history.
+            boolean drained;
+            try {
+                drained = shardWriter.directory.uploadLocalCommit()
+                        .get(manifestOptions.uploadWaitTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                drained = false;
+            } catch (ExecutionException | TimeoutException e) {
+                log.warn("failed to drain local uploads for retired shard {}", shardId.routeKey(), e);
+                drained = false;
+            }
+            if (!drained) {
+                // Keep the writer and local files; reconcile retries on the next tick. Never
+                // quarantine while content may exist only on local disk.
+                log.warn("deferred retire of shard {}: pending uploads did not drain", shardId.routeKey());
+                return;
+            }
+            // 3) Close PITs pinned to this shard's local lineage, then close and remove the writer.
+            closePitsFor(shardId);
+            if (writers.remove(shardId, shardWriter)) {
+                shardWriter.close();
+            }
+        }
+        // 4) Quarantine the WAL directory: after reassignment the shard's history continues from the
+        // remote snapshot, and stale same-name files would shadow the new content on openInput.
+        quarantineShardDirectories(shardId);
+    }
+
+    private void drainAndQuarantine(ShardId shardId, boolean drainUploads) throws IOException {
+        Path walPath = PathUtil.walDataPath(basePath, physicalIndexName(shardId));
+        if (!Files.isDirectory(walPath)) {
+            return;
+        }
+        if (drainUploads && hasCommittedSegmentFile(walPath)) {
+            try (S3CachingDirectory directory = openShardDirectory(shardId, remoteSnapshotStatuses())) {
+                boolean uploaded = directory.uploadLocalCommit()
+                        .get(manifestOptions.uploadWaitTimeout().toMillis(), TimeUnit.MILLISECONDS);
+                if (!uploaded) {
+                    log.warn("deferred quarantine of {}: pending uploads did not drain", shardId.routeKey());
+                    return;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (ExecutionException | TimeoutException e) {
+                log.warn("failed to drain local uploads for {}: {}", shardId.routeKey(), e.toString());
+                return;
+            }
+        }
+        quarantineShardDirectories(shardId);
+    }
+
+    private void quarantineShardDirectories(ShardId shardId) throws IOException {
+        String physical = physicalIndexName(shardId);
+        Path orphanRoot = basePath.resolve("orphan-wal");
+        IOException failure = quarantineDirectory(orphanRoot,
+                basePath.resolve(Hierarchy.WAL.path).resolve(physical), physical);
+        failure = quarantineDirectory(orphanRoot,
+                basePath.resolve(Hierarchy.SHARED.path).resolve(physical), physical);
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private IOException quarantineDirectory(Path orphanRoot, Path source, String physical) throws IOException {
+        if (!Files.exists(source)) {
+            return null;
+        }
+        try {
+            Files.createDirectories(orphanRoot);
+            // Same-volume rename: atomically removes the directory from wal/ scans while keeping the
+            // data on disk for forensics. openInput prefers WAL files without checksum validation, so
+            // leftover same-name files MUST not remain in place once ownership has moved on.
+            Files.move(source, orphanRoot.resolve(physical + "-" + UUID.randomUUID()));
+            log.info("quarantined local shard directory {} after ownership loss", source);
+            return null;
+        } catch (IOException e) {
+            log.warn("failed to quarantine local shard directory {}", source, e);
+            return e;
+        }
+    }
+
+    private Collection<ShardId> localWalShardIds() throws IOException {
+        Path walRoot = basePath.resolve(Hierarchy.WAL.path);
+        if (!Files.isDirectory(walRoot)) {
+            return List.of();
+        }
+        List<ShardId> shardIds = new ArrayList<>();
+        try (var stream = Files.list(walRoot)) {
+            for (Path dir : (Iterable<Path>) stream::iterator) {
+                String name = dir.getFileName().toString();
+                int suffix = name.lastIndexOf("__shard_");
+                if (suffix <= 0) {
+                    continue;
+                }
+                try {
+                    shardIds.add(new ShardId(name.substring(0, suffix),
+                            Integer.parseInt(name.substring(suffix + "__shard_".length()))));
+                } catch (NumberFormatException ignored) {
+                    // Not a physical shard directory.
+                }
+            }
+        }
+        return shardIds;
+    }
+
+    private void closePitsFor(ShardId shardId) {
+        for (String pitId : List.copyOf(pits.keySet())) {
+            PitContext pit = pits.get(pitId);
+            if (pit != null && shardId.equals(pit.shardId())) {
+                try {
+                    closePointInTime(pitId);
+                } catch (IOException e) {
+                    log.warn("failed to close point in time {} for retired shard {}", pitId, shardId.routeKey(), e);
+                }
+            }
+        }
+    }
+
+    @Override
     public int openPointInTimeCount() {
         cleanupExpiredPits();
         return pits.size();
@@ -988,6 +1200,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                         new AtomicInteger(),
                         new AtomicLong(System.nanoTime()),
                         new AtomicLong(System.nanoTime()),
+                        new AtomicBoolean(false),
                         new AtomicBoolean(false)
                 );
             } catch (IOException | RuntimeException e) {
@@ -1078,7 +1291,11 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
             }
             synchronized (shardWriter) {
                 try {
-                    if (shouldCommit(shardWriter)) {
+                    // Also re-drive the publish when the previous commit's snapshot has not been
+                    // published yet (slow/failed upload): with async upload the local commit is
+                    // already acknowledged, so shrinking the unpublished window shrinks the
+                    // failover loss window.
+                    if (shouldCommit(shardWriter) || shardWriter.snapshotPublishPending.get()) {
                         commitAndPublish(shardWriter);
                     }
                     if (shouldRefresh(shardWriter)) {
@@ -1138,6 +1355,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         warnSlowCommit(shardWriter, commitStarted);
         IndexCommit commit = shardWriter.deletionPolicy.snapshot();
         RetainedSnapshotCommit retained = retainSnapshotCommit(shardWriter, commit);
+        shardWriter.snapshotPublishPending.set(true);
         try {
             shardWriter.directory.publishIndexCommit(commit)
                     .whenComplete((published, throwable) -> {
@@ -1145,6 +1363,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                             log.warn("failed to publish snapshot for {}", shardWriter.shardId.routeKey(), throwable);
                         }
                         if (Boolean.TRUE.equals(published)) {
+                            shardWriter.snapshotPublishPending.set(false);
                             markCleanSnapshotPublished(shardWriter, retained.sequence);
                         }
                         completeSnapshotPublish(shardWriter, retained);
@@ -2570,7 +2789,8 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
             AtomicInteger uncommittedOperations,
             AtomicLong lastCommitNanos,
             AtomicLong lastRefreshNanos,
-            AtomicBoolean refreshPending
+            AtomicBoolean refreshPending,
+            AtomicBoolean snapshotPublishPending
     ) implements AutoCloseable {
         @Override
         public void close() throws IOException {

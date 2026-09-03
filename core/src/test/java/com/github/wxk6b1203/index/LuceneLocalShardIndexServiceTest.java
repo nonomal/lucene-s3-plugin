@@ -1,7 +1,13 @@
 package com.github.wxk6b1203.index;
 
+import com.github.wxk6b1203.cluster.ClusterNode;
+import com.github.wxk6b1203.cluster.ClusterState;
 import com.github.wxk6b1203.cluster.FieldMapping;
+import com.github.wxk6b1203.cluster.IndexSettings;
+import com.github.wxk6b1203.cluster.NodeRole;
 import com.github.wxk6b1203.cluster.ShardId;
+import com.github.wxk6b1203.cluster.ShardRouting;
+import com.github.wxk6b1203.cluster.ShardState;
 import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.mem.MemMockProvider;
@@ -21,10 +27,12 @@ import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -1852,6 +1860,71 @@ public class LuceneLocalShardIndexServiceTest {
                     .filter(name -> name.startsWith("segments_") && !name.startsWith("pending_segments_"))
                     .count();
         }
+    }
+
+    @Test
+    public void testReconcileRetiresDeposedWriterAndQuarantinesWal() throws Exception {
+        MemMockProvider metadata = new MemMockProvider();
+        ShardId shardId = new ShardId("books", 0);
+        try (LuceneLocalShardIndexService service = new LuceneLocalShardIndexService(
+                tempDir,
+                "bucket",
+                metadata,
+                new LocalFileRemoteObjectStore(tempDir.resolve("remote"))
+        )) {
+            service.index(new IndexDocumentRequest("books", shardId, "doc-1", Map.of("title", "Lucene")));
+            waitUntilClean(metadata, "books__shard_0");
+            Long generationBeforeRetire = metadata.latestSnapshot("books__shard_0") == null
+                    ? null
+                    : metadata.latestSnapshot("books__shard_0").getGeneration();
+
+            ClusterState state = new ClusterState(
+                    "test",
+                    1,
+                    "data-node-2",
+                    Map.of(
+                            "this-node", new ClusterNode("this-node", "this-node", "127.0.0.1", 9200,
+                                    Set.of(NodeRole.DATA), Instant.now()),
+                            "data-node-2", new ClusterNode("data-node-2", "data-node-2", "127.0.0.1", 9201,
+                                    Set.of(NodeRole.DATA), Instant.now())
+                    ),
+                    Map.of("books", new IndexSettings("books", 1, null, Instant.now())),
+                    List.of(new ShardRouting(shardId, ShardState.STARTED, "data-node-2", 2, 3)),
+                    Map.of(),
+                    Instant.now()
+            );
+
+            service.reconcileWithClusterState(state, "this-node");
+
+            // Deposed owner must NOT publish a NEW snapshot during the drain (the new owner owns
+            // the history line), but its committed content must be durable remotely (upload-only).
+            assertEquals(generationBeforeRetire,
+                    metadata.latestSnapshot("books__shard_0") == null
+                            ? null
+                            : metadata.latestSnapshot("books__shard_0").getGeneration());
+            assertTrue(metadata.listAll("books__shard_0", List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).isEmpty());
+            assertFalse(metadata.listAll("books__shard_0", List.of(IndexFileStatus.CLEAN)).isEmpty());
+
+            // WAL moved out of the scan path so a future reassignment cannot collide stale
+            // same-name files with the new owner's snapshot contents.
+            assertFalse(Files.exists(PathUtil.walDataPath(tempDir, "books__shard_0")));
+            assertTrue(hasFiles(tempDir.resolve("orphan-wal")));
+        }
+    }
+
+    private void waitUntilClean(MemMockProvider metadata, String physicalIndexName) throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (System.nanoTime() < deadline) {
+            if (!metadata.listAll(physicalIndexName, List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).isEmpty()) {
+                Thread.sleep(20);
+                continue;
+            }
+            if (!metadata.listAll(physicalIndexName, List.of(IndexFileStatus.CLEAN)).isEmpty()) {
+                return;
+            }
+            Thread.sleep(20);
+        }
+        throw new AssertionError("uploads did not drain before timeout");
     }
 
     private boolean hasFiles(Path path) throws IOException {

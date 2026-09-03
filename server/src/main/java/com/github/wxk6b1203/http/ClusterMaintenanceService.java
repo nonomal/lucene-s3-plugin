@@ -52,6 +52,7 @@ final class ClusterMaintenanceService {
     private volatile LocalCacheManager.CleanupStats lastCacheCleanupStats = new LocalCacheManager.CleanupStats(0, 0, 0, 0);
 
     enum MaintenanceTask {
+        WRITER_RECONCILE,
         WRITE_MAINTENANCE,
         UPLOAD_RETRY,
         SNAPSHOT_GC,
@@ -99,6 +100,7 @@ final class ClusterMaintenanceService {
 
     void run(MaintenanceTask task) {
         switch (task) {
+            case WRITER_RECONCILE -> reconcileWriters();
             case WRITE_MAINTENANCE -> runWriteMaintenance();
             case UPLOAD_RETRY -> retryOwnedShardUploads();
             case SNAPSHOT_GC -> runSnapshotGarbageCollection();
@@ -163,7 +165,10 @@ final class ClusterMaintenanceService {
                 .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
         try {
             for (ShardId shardId : localShardIndexService.shardIdsWithPendingWrites()) {
-                if (maintenanceEligible(state, shardId)) {
+                // Deposed writers are drained (upload-only) by WRITER_RECONCILE; committing and
+                // publishing here would interleave a divergent segment line into the new owner's
+                // snapshot sequence.
+                if (maintenanceEligible(state, shardId) && isOwnedBy(state, shardId)) {
                     shardIds.add(shardId);
                 }
             }
@@ -191,6 +196,34 @@ final class ClusterMaintenanceService {
     private boolean maintenanceEligible(ClusterState state, ShardId shardId) {
         var settings = state.indices().get(shardId.indexName());
         return settings != null && !settings.deletePending();
+    }
+
+    private boolean isOwnedBy(ClusterState state, ShardId shardId) {
+        if (!maintenanceEligible(state, shardId)) {
+            return false;
+        }
+        return state.routingTable().stream()
+                .filter(routing -> routing.shardId().equals(shardId))
+                .findFirst()
+                .map(routing -> routing.state() == ShardState.STARTED
+                        && localNode.id().equals(routing.nodeId()))
+                .orElse(false);
+    }
+
+    private void reconcileWriters() {
+        ClusterState state;
+        try {
+            state = clusterStateRepository.current();
+        } catch (IOException e) {
+            // Never act on missing evidence: a stale read could quarantine a shard this node owns.
+            log.warn("failed to load cluster state for writer reconcile", e);
+            return;
+        }
+        try {
+            localShardIndexService.reconcileWithClusterState(state, localNode.id());
+        } catch (IOException e) {
+            log.warn("failed to reconcile local shard writers", e);
+        }
     }
 
     void runSnapshotGarbageCollection() {
@@ -241,7 +274,8 @@ final class ClusterMaintenanceService {
                 .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
         for (ShardId shardId : localShardIndexService.shardIdsWithPendingUploads()) {
             if ((indexFilter == null || indexFilter.equals(shardId.indexName()))
-                    && maintenanceEligible(state, shardId)) {
+                    && maintenanceEligible(state, shardId)
+                    && isOwnedBy(state, shardId)) {
                 shardIds.add(shardId);
             }
         }

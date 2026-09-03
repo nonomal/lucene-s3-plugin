@@ -1,6 +1,7 @@
 package com.github.wxk6b1203.store;
 
 import com.github.wxk6b1203.metadata.common.IndexFile;
+import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.mem.MemMockProvider;
 import com.github.wxk6b1203.store.common.PathUtil;
@@ -42,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class S3CachingDirectoryTest {
     @TempDir
@@ -300,12 +302,20 @@ public class S3CachingDirectoryTest {
             waitUntil(() -> {
                 try {
                     directory.publishLocalCommit();
-                    return metadata.listAll("test-index", List.of(IndexFileStatus.CLEAN)).size() == 2;
+                    // Retry completes the pending uploads for the SAME commit: no file may stay
+                    // DIRTY/UPLOADING, and no new commit epoch is created by the retry.
+                    return metadata.listAll("test-index", List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).isEmpty();
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
-            assertEquals(2, metadata.listAll("test-index", List.of(IndexFileStatus.CLEAN)).size());
+            assertEquals(0, metadata.listAll("test-index", List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).size());
+            assertTrue(metadata.listAll("test-index", List.of(IndexFileStatus.CLEAN)).size() >= 2);
+            assertEquals(1L, metadata.listAll("test-index", List.of(IndexFileStatus.CLEAN)).stream()
+                    .filter(file -> file.getName().startsWith("segments_"))
+                    .mapToLong(IndexFileMetadata::getEpoch)
+                    .max()
+                    .orElseThrow());
         }
     }
 

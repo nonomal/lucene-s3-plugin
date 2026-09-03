@@ -111,7 +111,7 @@ class ClusterMaintenanceServiceTest {
     }
 
     @Test
-    void writeMaintenanceIncludesPendingLocalWritesAfterOwnershipMoves() {
+    void writeMaintenanceSkipsPendingLocalWritesAfterOwnershipMoves() {
         ClusterNode node1 = new ClusterNode(
                 "node-1",
                 "node-1",
@@ -146,11 +146,13 @@ class ClusterMaintenanceServiceTest {
 
         service.run(ClusterMaintenanceService.MaintenanceTask.WRITE_MAINTENANCE);
 
-        assertEquals(Set.of(shardId), Set.copyOf(localShardService.writeMaintenanceShardIds));
+        // The shard moved to node-2: WRITE_MAINTENANCE must not commit-and-publish the deposed
+        // writer (divergent snapshot line); WRITER_RECONCILE drains it upload-only instead.
+        assertEquals(Set.of(), Set.copyOf(localShardService.writeMaintenanceShardIds));
     }
 
     @Test
-    void uploadRetryIncludesPendingLocalUploadsAfterOwnershipMoves() {
+    void uploadRetrySkipsPendingLocalUploadsAfterOwnershipMoves() {
         ClusterNode node1 = new ClusterNode(
                 "node-1",
                 "node-1",
@@ -186,7 +188,99 @@ class ClusterMaintenanceServiceTest {
 
         service.run(ClusterMaintenanceService.MaintenanceTask.UPLOAD_RETRY);
 
-        assertEquals(Set.of(shardId), Set.copyOf(localShardService.retryShardIds));
+        // Deposed owners must not publishLocalCommit(); WRITER_RECONCILE drains upload-only.
+        assertEquals(Set.of(), Set.copyOf(localShardService.retryShardIds));
+    }
+
+    @Test
+    void writerReconcileDelegatesToLocalShardServiceWithLocalNodeId() {
+        ClusterNode node1 = new ClusterNode(
+                "node-1",
+                "node-1",
+                "127.0.0.1",
+                9200,
+                Set.of(NodeRole.MASTER, NodeRole.DATA),
+                Instant.now()
+        );
+        ClusterNode node2 = new ClusterNode(
+                "node-2",
+                "node-2",
+                "127.0.0.1",
+                9201,
+                Set.of(NodeRole.DATA),
+                Instant.now()
+        );
+        ShardId shardId = new ShardId("books", 0);
+        ClusterState state = new ClusterState(
+                "test",
+                1,
+                node1.id(),
+                Map.of(node1.id(), node1, node2.id(), node2),
+                Map.of("books", new IndexSettings("books", 1, null, Instant.now())),
+                List.of(new ShardRouting(shardId, ShardState.STARTED, node2.id(), 1, 1)),
+                Map.of(),
+                Instant.now()
+        );
+        BlockingShardService localShardService = new BlockingShardService();
+        ClusterMaintenanceService service = newService(node1, state, localShardService, (index, shards) -> {
+        });
+
+        service.run(ClusterMaintenanceService.MaintenanceTask.WRITER_RECONCILE);
+
+        assertEquals(1, localShardService.reconcileCount.get());
+        assertEquals(node1.id(), localShardService.reconciledOwnerNodeId);
+    }
+
+    @Test
+    void writerReconcileSkippedWhenClusterStateUnavailable() {
+        ClusterNode node1 = new ClusterNode(
+                "node-1",
+                "node-1",
+                "127.0.0.1",
+                9200,
+                Set.of(NodeRole.MASTER, NodeRole.DATA),
+                Instant.now()
+        );
+        ClusterState state = new ClusterState(
+                "test",
+                1,
+                node1.id(),
+                Map.of(node1.id(), node1),
+                Map.of(),
+                List.of(),
+                Map.of(),
+                Instant.now()
+        );
+        BlockingShardService localShardService = new BlockingShardService();
+        ClusterStateRepository failingRepository = new ClusterStateRepository() {
+            @Override
+            public ClusterState current() throws IOException {
+                throw new IOException("etcd unavailable");
+            }
+
+            @Override
+            public ClusterState update(ClusterStateUpdate update) throws IOException {
+                throw new IOException("etcd unavailable");
+            }
+        };
+        ClusterMaintenanceService service = new ClusterMaintenanceService(
+                failingRepository,
+                new NoopClusterCoordinator(),
+                node1,
+                localShardService,
+                new MemMockProvider(),
+                new LocalFileRemoteObjectStore(tempDir.resolve("remote-objects")),
+                1,
+                (index, shards) -> {
+                },
+                null,
+                Duration.ofSeconds(1)
+        );
+
+        service.run(ClusterMaintenanceService.MaintenanceTask.WRITER_RECONCILE);
+
+        // Must never act on missing evidence.
+        assertEquals(0, localShardService.reconcileCount.get());
     }
 
     @Test
@@ -331,6 +425,14 @@ class ClusterMaintenanceServiceTest {
         private volatile Collection<ShardId> failedRetryShardIds = List.of();
         private final List<ShardId> retryAttempts = new CopyOnWriteArrayList<>();
         private volatile boolean blockWriteMaintenance;
+        private final AtomicInteger reconcileCount = new AtomicInteger();
+        private volatile String reconciledOwnerNodeId;
+
+        @Override
+        public void reconcileWithClusterState(ClusterState state, String expectedOwnerNodeId) {
+            reconciledOwnerNodeId = expectedOwnerNodeId;
+            reconcileCount.incrementAndGet();
+        }
 
         @Override
         public IndexDocumentResponse index(IndexDocumentRequest request) {

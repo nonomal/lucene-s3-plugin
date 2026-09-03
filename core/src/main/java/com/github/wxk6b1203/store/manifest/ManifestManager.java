@@ -7,6 +7,8 @@ import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
+import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager.FileVersion;
+import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager.StatusFlipOutcome;
 import com.github.wxk6b1203.store.directory.Hierarchy;
 import com.github.wxk6b1203.store.common.FileChecksums;
 import com.github.wxk6b1203.store.common.PathUtil;
@@ -19,6 +21,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -36,10 +39,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 @Slf4j
 public class ManifestManager implements AutoCloseable {
     private static final long IN_FLIGHT_POLL_INTERVAL_MILLIS = 20L;
+    private static final long COMPACTION_GRACE_MILLIS = Duration.ofMinutes(10).toMillis();
     private static final ConcurrentHashMap<UploadKey, CompletableFuture<Void>> IN_FLIGHT_UPLOADS = new ConcurrentHashMap<>();
 
     private final ManifestOptions options;
@@ -116,35 +121,11 @@ public class ManifestManager implements AutoCloseable {
             Collection<CommittingIndexFile> indexFiles,
             Collection<String> snapshotFileNames
     ) throws IOException {
+        BuiltBatch built = buildBatch(indexFiles);
+        List<IndexFile> batch = built.files();
         List<CommitFile> commitFiles = new ArrayList<>();
         List<PendingUpload> pendingUploads = new ArrayList<>();
-        List<IndexFile> batch = new ArrayList<>();
-        List<Path> batchSources = new ArrayList<>();
-        String snapshotIndexName = null;
-        for (CommittingIndexFile indexFile : indexFiles) {
-            if (snapshotIndexName == null) {
-                snapshotIndexName = indexFile.indexName();
-            } else if (!Objects.equals(snapshotIndexName, indexFile.indexName())) {
-                throw new IllegalArgumentException("snapshot commit must target a single physical index");
-            }
-            Path uploadSource = indexFile.filePath();
-            long size = Files.size(uploadSource);
-            long checksum = FileChecksums.crc32(uploadSource);
-            long modifiedTime = Files.getLastModifiedTime(uploadSource).toMillis();
-            String fileName = indexFile.filePath().getFileName().toString();
-            String objectKey = remoteObjectKey(indexFile.indexName(), fileName, checksum, size);
-            IndexFile file = new IndexFile(
-                    indexFile.indexName(),
-                    fileName,
-                    Hierarchy.DATA.path,
-                    objectKey,
-                    size,
-                    checksum,
-                    modifiedTime
-            );
-            batch.add(file);
-            batchSources.add(uploadSource);
-        }
+        String snapshotIndexName = indexFiles.isEmpty() ? null : indexFiles.iterator().next().indexName();
         List<IndexFileMetadata> metadatas = batch.isEmpty()
                 ? List.of()
                 : metadataManager.commitFiles(batch);
@@ -152,7 +133,7 @@ public class ManifestManager implements AutoCloseable {
             IndexFile file = batch.get(i);
             IndexFileMetadata metadata = metadatas.get(i);
             if (metadata != null) {
-                pendingUploads.add(new PendingUpload(batchSources.get(i), metadata));
+                pendingUploads.add(new PendingUpload(built.sources().get(i), metadata));
             }
             commitFiles.add(new CommitFile(file.indexName(), file.name()));
         }
@@ -174,6 +155,44 @@ public class ManifestManager implements AutoCloseable {
             }
             return CompletableFuture.completedFuture(published);
         }
+    }
+
+    /**
+     * Upload locally committed files to S3 WITHOUT publishing a snapshot. Used to drain data on
+     * nodes that lost shard ownership (failover) or hold leftover WAL directories after a restart.
+     * Whether the content enters the visible history is decided by the current owner's commit line;
+     * a deposed owner publishing snapshots would interleave a divergent segment line into the
+     * snapshot sequence. Uploads are idempotent (content-addressed object keys) and metadata
+     * transitions are epoch-guarded, so this never corrupts the new owner's state.
+     */
+    public CompletableFuture<Boolean> uploadOnly(Collection<CommittingIndexFile> indexFiles) throws IOException {
+        List<CommittingIndexFile> present = new ArrayList<>();
+        for (CommittingIndexFile indexFile : indexFiles) {
+            if (Files.exists(indexFile.filePath())) {
+                present.add(indexFile);
+            }
+        }
+        if (present.isEmpty()) {
+            return CompletableFuture.completedFuture(true);
+        }
+        BuiltBatch built = buildBatch(present);
+        List<IndexFileMetadata> metadatas = metadataManager.commitFiles(built.files());
+        List<PendingUpload> pendingUploads = new ArrayList<>();
+        for (int i = 0; i < built.files().size(); i++) {
+            IndexFileMetadata metadata = metadatas.get(i);
+            if (metadata != null) {
+                pendingUploads.add(new PendingUpload(built.sources().get(i), metadata));
+            }
+        }
+        if (pendingUploads.isEmpty()) {
+            return CompletableFuture.completedFuture(true);
+        }
+        CompletableFuture<Boolean> upload = CompletableFuture.supplyAsync(
+                () -> transferAll(pendingUploads),
+                uploadWorkerPool()
+        );
+        trackUpload(upload);
+        return upload;
     }
 
     public void download(IndexFileMetadata metadata, Path target) throws IOException {
@@ -273,68 +292,244 @@ public class ManifestManager implements AutoCloseable {
         for (IndexCommitSnapshot snapshot : deleteCandidates) {
             metadataManager.deleteSnapshot(indexName, snapshot.getGeneration());
         }
+        compactManifestEntries(indexName, snapshots, protectedObjectKeys);
+    }
+
+    /**
+     * Compaction: delete CLEAN manifest entries no longer referenced by any retained snapshot.
+     * Without this the per-file history grows unboundedly with merges (entries are only reclaimed
+     * on whole-index delete), and every full-prefix scan — readiness probes, upload status,
+     * UPLOAD_RETRY — gets slower forever, on top of the etcd storage cost. An entry is stale when
+     * its name is absent from the latest snapshot (the live lineage) and its modified time is
+     * older than the grace window (a publish may still be in flight); those contents are exactly
+     * the ones the object-level GC above already stopped protecting.
+     */
+    private void compactManifestEntries(String indexName,
+                                        List<IndexCommitSnapshot> snapshotsDescending,
+                                        Set<String> protectedObjectKeys) {
+        try {
+            Set<String> latestNames = snapshotsDescending.isEmpty()
+                    ? Set.of()
+                    : snapshotsDescending.getFirst().getFiles().stream()
+                            .map(IndexFileMetadata::getName)
+                            .collect(Collectors.toSet());
+            long graceCutoff = System.currentTimeMillis() - COMPACTION_GRACE_MILLIS;
+            List<IndexFileMetadata> cleanEntries = metadataManager.listAll(indexName, List.of(IndexFileStatus.CLEAN));
+            List<String> stale = new ArrayList<>();
+            for (IndexFileMetadata entry : cleanEntries) {
+                if (latestNames.contains(entry.getName())) {
+                    continue;
+                }
+                if (entry.getModifiedTime() >= graceCutoff) {
+                    continue;
+                }
+                String objectKey = entry.getObjectKey();
+                if (objectKey != null && !objectKey.isBlank() && protectedObjectKeys.contains(objectKey)) {
+                    continue;
+                }
+                stale.add(entry.getName());
+            }
+            if (!stale.isEmpty()) {
+                metadataManager.deleteFiles(indexName, stale);
+                log.debug("compacted {} stale manifest entries for {}", stale.size(), indexName);
+            }
+        } catch (RuntimeException e) {
+            log.warn("Failed to compact manifest entries for {}", indexName, e);
+        }
+    }
+
+    private BuiltBatch buildBatch(Collection<CommittingIndexFile> indexFiles) throws IOException {
+        List<IndexFile> batch = new ArrayList<>();
+        List<Path> batchSources = new ArrayList<>();
+        String indexName = null;
+        for (CommittingIndexFile indexFile : indexFiles) {
+            if (indexName == null) {
+                indexName = indexFile.indexName();
+            } else if (!Objects.equals(indexName, indexFile.indexName())) {
+                throw new IllegalArgumentException("commit must target a single physical index");
+            }
+            Path uploadSource = indexFile.filePath();
+            long size = Files.size(uploadSource);
+            long checksum = FileChecksums.crc32(uploadSource);
+            long modifiedTime = Files.getLastModifiedTime(uploadSource).toMillis();
+            String fileName = indexFile.filePath().getFileName().toString();
+            String objectKey = remoteObjectKey(indexFile.indexName(), fileName, checksum, size);
+            batch.add(new IndexFile(
+                    indexFile.indexName(),
+                    fileName,
+                    Hierarchy.DATA.path,
+                    objectKey,
+                    size,
+                    checksum,
+                    modifiedTime
+            ));
+            batchSources.add(uploadSource);
+        }
+        return new BuiltBatch(batch, batchSources);
+    }
+
+    private record BuiltBatch(List<IndexFile> files, List<Path> sources) {
     }
 
     private boolean uploadCommit(List<PendingUpload> pendingUploads, SnapshotCommit snapshotCommit) {
-        boolean dataFilesUploaded = true;
-        for (PendingUpload pendingUpload : pendingUploads) {
-            if (!isCommittedSegmentFile(pendingUpload.metadata().getName())) {
-                dataFilesUploaded &= upload(pendingUpload.source(), pendingUpload.metadata());
-            }
+        if (pendingUploads.isEmpty()) {
+            return publishSnapshotIfClean(snapshotCommit);
         }
-        if (!dataFilesUploaded) {
+        if (!transferAll(pendingUploads)) {
             return false;
         }
-        boolean segmentFilesUploaded = true;
-        for (PendingUpload pendingUpload : pendingUploads) {
-            if (isCommittedSegmentFile(pendingUpload.metadata().getName())) {
-                segmentFilesUploaded &= upload(pendingUpload.source(), pendingUpload.metadata());
-            }
-        }
-        return segmentFilesUploaded && publishSnapshotIfClean(snapshotCommit);
+        return publishSnapshotIfClean(snapshotCommit);
     }
 
-    private boolean upload(Path source, IndexFileMetadata metadata) {
-        UploadKey uploadKey = new UploadKey(metadata.getObjectKey(), metadata.getEpoch());
-        if (!acquireUploadSlot(uploadKey, metadata)) {
-            IndexFileMetadata current = metadataManager.fileMetadata(metadata.getIndexName(), metadata.getName());
-            return sameMetadataIdentity(metadata, current) && remoteReadable(current.getStatus());
+    /**
+     * Uploads files in batched stages. Etcd round trips used to scale with the file count
+     * (per-file read + two read/CAS status transitions ≈ 7 round trips per file); the batched
+     * flow is a constant ~5 plus one chunked CAS per flip stage:
+     *  1. one batched read of the current entries (identity check against the commit),
+     *  2. per phase (data files, then the segments file): one batched DIRTY→UPLOADING flip,
+     *     the S3 puts, then one batched →CLEAN flip — the segments file only becomes visible
+     *     after its data files are confirmed durable at the same epoch.
+     */
+    private boolean transferAll(List<PendingUpload> pendingUploads) {
+        if (pendingUploads.isEmpty()) {
+            return true;
         }
         try {
             ensureRemoteObjectStore();
-            IndexFileMetadata current = metadataManager.fileMetadata(metadata.getIndexName(), metadata.getName());
-            if (!sameMetadataIdentity(metadata, current)) {
+        } catch (IOException e) {
+            log.error("Remote object store unavailable; aborting upload", e);
+            return false;
+        }
+        String indexName = pendingUploads.getFirst().metadata().getIndexName();
+        Map<String, FileVersion> versions = readVersionsQuietly(indexName, pendingUploads);
+        if (versions == null) {
+            return false;
+        }
+        List<ActiveUpload> active = new ArrayList<>();
+        for (PendingUpload pendingUpload : pendingUploads) {
+            IndexFileMetadata expected = pendingUpload.metadata();
+            FileVersion version = versions.get(expected.getName());
+            if (version == null || !sameMetadataIdentity(expected, version.metadata())) {
+                log.error("Manifest entry for {}/{} changed since commit; aborting publish", indexName, expected.getName());
                 return false;
             }
-            if (remoteReadable(current.getStatus())) {
-                return true;
+            if (remoteReadable(version.metadata().getStatus())) {
+                continue;
             }
-            if (current.getStatus() == IndexFileStatus.DIRTY) {
-                metadataManager.updateFileStatus(
-                        metadata.getIndexName(),
-                        metadata.getName(),
-                        metadata.getEpoch(),
-                        IndexFileStatus.UPLOADING
-                );
-                if (!stillCurrent(metadata, IndexFileStatus.UPLOADING)) {
+            if (version.metadata().getStatus() != IndexFileStatus.DIRTY
+                    && version.metadata().getStatus() != IndexFileStatus.UPLOADING) {
+                log.error("Unexpected status {} for {}/{}; aborting publish",
+                        version.metadata().getStatus(), indexName, expected.getName());
+                return false;
+            }
+            active.add(new ActiveUpload(pendingUpload, version));
+        }
+        if (active.isEmpty()) {
+            return true;
+        }
+        if (!uploadPhase(indexName, active, false)) {
+            return false;
+        }
+        return uploadPhase(indexName, active, true);
+    }
+
+    private boolean uploadPhase(String indexName, List<ActiveUpload> active, boolean segmentsPhase) {
+        List<ActiveUpload> phase = new ArrayList<>();
+        for (ActiveUpload upload : active) {
+            boolean isSegment = isCommittedSegmentFile(upload.pending.metadata().getName());
+            if (isSegment != segmentsPhase) {
+                continue;
+            }
+            if (upload.version.metadata().getStatus() != IndexFileStatus.DIRTY) {
+                phase.add(upload);
+                continue;
+            }
+            // Mark in flight before the first byte moves; a crash here leaves an UPLOADING
+            // entry that UPLOAD_RETRY recovers, exactly like the previous per-file flow.
+            StatusFlipOutcome outcome = metadataManager.compareAndSetStatus(
+                    indexName, upload.version, IndexFileStatus.UPLOADING);
+            if (!outcome.flipped()) {
+                log.warn("Failed to mark {}/{} uploading; another writer owns the entry",
+                        indexName, upload.pending.metadata().getName());
+                return false;
+            }
+            upload.version = outcome.updated();
+            upload.flippedHere = true;
+            phase.add(upload);
+        }
+        for (ActiveUpload upload : phase) {
+            if (!transfer(upload, indexName)) {
+                return false;
+            }
+        }
+        for (ActiveUpload upload : phase) {
+            StatusFlipOutcome outcome = metadataManager.compareAndSetStatus(
+                    indexName, upload.version, IndexFileStatus.CLEAN);
+            if (!outcome.flipped()) {
+                log.warn("Failed to mark {}/{} clean; publish retries on the next maintenance tick",
+                        indexName, upload.pending.metadata().getName());
+                return false;
+            }
+            upload.version = outcome.updated();
+        }
+        return true;
+    }
+
+    private Map<String, FileVersion> readVersionsQuietly(String indexName, List<PendingUpload> pendingUploads) {
+        try {
+            List<String> names = pendingUploads.stream()
+                    .map(pendingUpload -> pendingUpload.metadata().getName())
+                    .toList();
+            return metadataManager.fileVersionsByName(indexName, names);
+        } catch (RuntimeException e) {
+            log.error("Failed to read manifest state before uploading for {}", indexName, e);
+            return null;
+        }
+    }
+
+    /** S3 put for one file, guarded by the in-flight upload slot (cross-manager dedup). */
+    private boolean transfer(ActiveUpload upload, String indexName) {
+        IndexFileMetadata metadata = upload.pending.metadata();
+        UploadKey uploadKey = new UploadKey(metadata.getObjectKey(), metadata.getEpoch());
+        if (!acquireUploadSlot(uploadKey, metadata)) {
+            IndexFileMetadata current = metadataManager.fileMetadata(indexName, metadata.getName());
+            return current != null
+                    && sameMetadataIdentity(metadata, current)
+                    && remoteReadable(current.getStatus());
+        }
+        try {
+            ensureRemoteObjectStore();
+            if (!upload.flippedHere) {
+                // The UPLOADING status predates this call (recovery of a previous run, or another
+                // uploader may have finished while we waited for the slot): re-check before paying
+                // for the put.
+                IndexFileMetadata current = metadataManager.fileMetadata(indexName, metadata.getName());
+                if (current == null || !sameMetadataIdentity(metadata, current)) {
+                    log.error("Manifest entry for {}/{} changed during upload", indexName, metadata.getName());
                     return false;
                 }
-            } else if (current.getStatus() != IndexFileStatus.UPLOADING) {
-                return false;
+                if (remoteReadable(current.getStatus())) {
+                    return true;
+                }
             }
-            remoteObjectStore.put(metadata.getObjectKey(), source);
-            metadataManager.updateFileStatus(
-                    metadata.getIndexName(),
-                    metadata.getName(),
-                    metadata.getEpoch(),
-                    IndexFileStatus.CLEAN
-            );
-            return stillCurrent(metadata, IndexFileStatus.CLEAN);
+            remoteObjectStore.put(metadata.getObjectKey(), upload.pending.source());
+            return true;
         } catch (Exception e) {
             log.error("Failed to upload index file {}/{}", metadata.getIndexName(), metadata.getName(), e);
             return false;
         } finally {
             releaseUploadSlot(uploadKey);
+        }
+    }
+
+    private static final class ActiveUpload {
+        private final PendingUpload pending;
+        private FileVersion version;
+        private boolean flippedHere;
+
+        private ActiveUpload(PendingUpload pending, FileVersion version) {
+            this.pending = pending;
+            this.version = version;
         }
     }
 
@@ -382,12 +577,6 @@ public class ManifestManager implements AutoCloseable {
         return current != null
                 && current.getEpoch() == expected.getEpoch()
                 && Objects.equals(current.getObjectKey(), expected.getObjectKey());
-    }
-
-    private boolean stillCurrent(IndexFileMetadata expected, IndexFileStatus status) {
-        IndexFileMetadata current = metadataManager.fileMetadata(expected.getIndexName(), expected.getName());
-        return sameMetadataIdentity(expected, current)
-                && current.getStatus() == status;
     }
 
     private SnapshotCommit snapshotCommit(

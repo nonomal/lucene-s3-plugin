@@ -220,7 +220,6 @@ public class S3CachingDirectory extends BaseDirectory {
     }
 
     /**
-     * @see IndexWriter#finishCommit()
      * @throws IOException
      */
     @Override
@@ -246,10 +245,37 @@ public class S3CachingDirectory extends BaseDirectory {
         return publishLocalFiles(commit.getFileNames());
     }
 
+    /**
+     * Upload the latest local commit's files to S3 WITHOUT publishing a snapshot. Used to drain
+     * data on nodes that lost shard ownership or hold leftover WAL directories after a restart.
+     * Whether these files join the visible history is decided by the current owner's commit line;
+     * this only guarantees the content becomes durable in remote storage.
+     */
+    public CompletableFuture<Boolean> uploadLocalCommit() throws IOException {
+        ensureOpen();
+        List<String> visibleFiles = List.of(listAll());
+        if (visibleFiles.stream().noneMatch(this::isCommittedSegmentFile)) {
+            return CompletableFuture.completedFuture(true);
+        }
+        List<CommittingIndexFile> files = new ArrayList<>();
+        for (String name : currentCommitFileNames(visibleFiles)) {
+            if (Files.exists(walDataPath.resolve(name))) {
+                files.add(new CommittingIndexFile(indexName, walDataPath.resolve(name)));
+            }
+        }
+        if (files.isEmpty()) {
+            return CompletableFuture.completedFuture(true);
+        }
+        return manifestManager.uploadOnly(files);
+    }
+
     private CompletableFuture<Boolean> publishLocalFiles(Collection<String> snapshotFileNames) throws IOException {
         List<CommittingIndexFile> files = new ArrayList<>();
         for (String name : snapshotFileNames) {
-            if (shouldPublish(name) && shouldCommitToManifest(name) && Files.exists(walDataPath.resolve(name))) {
+            // No per-file manifest lookup here: ManifestManager.commitFiles batch-reads the named keys
+            // in one transaction and skips already-durable content. A per-file pre-filter would cost
+            // one metadata-store round trip per file on every commit.
+            if (shouldPublish(name) && Files.exists(walDataPath.resolve(name))) {
                 files.add(new CommittingIndexFile(indexName, walDataPath.resolve(name)));
             }
         }
@@ -567,16 +593,6 @@ public class S3CachingDirectory extends BaseDirectory {
 
     private boolean shouldPublish(String name) {
         return !name.startsWith("pending_segments_") && !name.equals("write.lock");
-    }
-
-    private boolean shouldCommitToManifest(String name) throws IOException {
-        try {
-            IndexFileMetadata metadata = manifestManager.fileMetadata(indexName, name);
-            return metadata.getStatus() == IndexFileStatus.DIRTY
-                    || metadata.getStatus() == IndexFileStatus.UPLOADING;
-        } catch (java.nio.file.NoSuchFileException e) {
-            return true;
-        }
     }
 
     private boolean isCommittedSegmentFile(String name) {

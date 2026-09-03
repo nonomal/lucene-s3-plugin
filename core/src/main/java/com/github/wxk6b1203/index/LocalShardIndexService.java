@@ -1,5 +1,6 @@
 package com.github.wxk6b1203.index;
 
+import com.github.wxk6b1203.cluster.ClusterState;
 import com.github.wxk6b1203.cluster.ShardId;
 import com.github.wxk6b1203.search.*;
 
@@ -68,6 +69,22 @@ public interface LocalShardIndexService extends AutoCloseable {
 
     default void runWriteMaintenance(Collection<ShardId> shardIds) throws IOException {
         runWriteMaintenance();
+    }
+
+    /**
+     * Align local shard state with cluster state: retire writers and drain/quarantine leftover
+     * local WAL data for shards no longer owned by {@code expectedOwnerNodeId}. Must be a no-op
+     * when the cluster state cannot be read (never act on stale or missing evidence).
+     */
+    default void reconcileWithClusterState(ClusterState state, String expectedOwnerNodeId) throws IOException {
+    }
+
+    /**
+     * Stop serving the given shard locally: drain committed-but-unuploaded content (upload only,
+     * no snapshot publish), close associated PITs and the writer, then quarantine local WAL files
+     * so a same-name-different-content collision cannot corrupt a future reassignment.
+     */
+    default void retireShardWriter(ShardId shardId) throws IOException {
     }
 
     default void cleanupIdleResources() throws IOException {

@@ -28,6 +28,7 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ManifestManagerTest {
@@ -377,6 +378,51 @@ public class ManifestManagerTest {
         assertEquals(1, metadata.listSnapshots("books").size());
         assertTrue(remote.deletes.contains(firstSegmentObjectKey));
         assertTrue(remote.deletes.contains(firstDataObjectKey));
+    }
+
+    @Test
+    public void testSnapshotGarbageCollectionCompactsStaleCleanEntries() throws Exception {
+        MemMockProvider metadata = new MemMockProvider();
+        RecordingRemoteObjectStore remote = new RecordingRemoteObjectStore();
+        ManifestManager manager = new ManifestManager(new ManifestOptions("bucket"), remote, metadata);
+        long now = System.currentTimeMillis();
+        long graceExpired = now - Duration.ofMinutes(11).toMillis();
+
+        // Snapshot generation 1 references _0.si + segments_1 (both CLEAN).
+        var data = new com.github.wxk6b1203.metadata.common.IndexFile(
+                "books__shard_0", "_0.si", "_data", "books__shard_0/_data/_0.si.aaa.1", 1, 10, now);
+        var segments = new com.github.wxk6b1203.metadata.common.IndexFile(
+                "books__shard_0", "segments_1", "_data", "books__shard_0/_data/segments_1.bbb.1", 1, 20, now);
+        metadata.commitFile(data);
+        metadata.commitFile(segments);
+        markClean(metadata, "_0.si");
+        markClean(metadata, "segments_1");
+        metadata.publishSnapshot("books__shard_0", "segments_1", List.of(
+                metadata.fileMetadata("books__shard_0", "_0.si"),
+                metadata.fileMetadata("books__shard_0", "segments_1")));
+
+        // A stale-history entry: CLEAN, not referenced by any retained snapshot, older than the
+        // compaction grace window (its object was already unreferenced and GC'd).
+        var stale = new com.github.wxk6b1203.metadata.common.IndexFile(
+                "books__shard_0", "_9.old", "_data", "books__shard_0/_data/_9.old.ccc.1", 1, 30, graceExpired);
+        metadata.commitFile(stale);
+        markClean(metadata, "_9.old");
+
+        manager.garbageCollectSnapshots("books__shard_0", 1);
+
+        // Compacted: stale history entry removed...
+        assertNull(metadata.fileMetadata("books__shard_0", "_9.old"));
+        // ...while the live lineage's entries survive.
+        assertEquals(IndexFileStatus.CLEAN, metadata.fileMetadata("books__shard_0", "_0.si").getStatus());
+        assertEquals(IndexFileStatus.CLEAN, metadata.fileMetadata("books__shard_0", "segments_1").getStatus());
+        assertEquals(1, metadata.listSnapshots("books__shard_0").size());
+        manager.close();
+    }
+
+    /** DIRTY → UPLOADING → CLEAN, mirroring the upload state machine. */
+    private void markClean(MemMockProvider metadata, String name) {
+        metadata.updateFileStatus("books__shard_0", name, 1, IndexFileStatus.UPLOADING);
+        metadata.updateFileStatus("books__shard_0", name, 1, IndexFileStatus.CLEAN);
     }
 
     private void waitUntil(BooleanSupplier condition) throws InterruptedException {
