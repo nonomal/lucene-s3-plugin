@@ -7,7 +7,7 @@ import com.github.wxk6b1203.metadata.provider.mem.MemMockProvider;
 import com.github.wxk6b1203.store.common.PathUtil;
 import com.github.wxk6b1203.store.directory.S3CachingDirectory;
 import com.github.wxk6b1203.store.directory.S3DirectoryOptions;
-import com.github.wxk6b1203.store.directory.S3LockFactory;
+import com.github.wxk6b1203.store.directory.ProcessLocalLockFactory;
 import com.github.wxk6b1203.store.manifest.ManifestManager;
 import com.github.wxk6b1203.store.manifest.ManifestOptions;
 import com.github.wxk6b1203.store.object.RemoteObjectStore;
@@ -216,7 +216,7 @@ public class S3CachingDirectoryTest {
         ManifestManager manager = new ManifestManager(new ManifestOptions("test-bucket"), remote, metadata);
         try (S3CachingDirectory directory = new S3CachingDirectory(
                 new S3DirectoryOptions(tempDir, indexName),
-                new S3LockFactory(),
+                new ProcessLocalLockFactory(),
                 manager,
                 List.of(IndexFileStatus.CLEAN, IndexFileStatus.PINNED),
                 false
@@ -270,7 +270,7 @@ public class S3CachingDirectoryTest {
         ManifestManager manager = new ManifestManager(new ManifestOptions("test-bucket"), remote, metadata);
         try (S3CachingDirectory directory = new S3CachingDirectory(
                 new S3DirectoryOptions(tempDir, indexName),
-                new S3LockFactory(),
+                new ProcessLocalLockFactory(),
                 manager,
                 List.of(IndexFileStatus.CLEAN, IndexFileStatus.PINNED),
                 false
@@ -290,7 +290,7 @@ public class S3CachingDirectoryTest {
         ManifestManager manager = new ManifestManager(new ManifestOptions("test-bucket"), remote, metadata);
         try (S3CachingDirectory directory = new S3CachingDirectory(
                 new S3DirectoryOptions(tempDir, "test-index"),
-                new S3LockFactory(),
+                new ProcessLocalLockFactory(),
                 manager
         )) {
             commitDocument(directory, "doc-1");
@@ -344,7 +344,7 @@ public class S3CachingDirectoryTest {
     private S3CachingDirectory newDirectory(String indexName, MemMockProvider metadata) throws IOException {
         ManifestOptions manifestOptions = new ManifestOptions("test-bucket");
         ManifestManager manager = new ManifestManager(manifestOptions, new NoopRemoteObjectStore(), metadata);
-        return new S3CachingDirectory(new S3DirectoryOptions(tempDir, indexName), new S3LockFactory(), manager);
+        return new S3CachingDirectory(new S3DirectoryOptions(tempDir, indexName), new ProcessLocalLockFactory(), manager);
     }
 
     private S3CachingDirectory newReadOnlyDirectory(String indexName, MemMockProvider metadata) throws IOException {
@@ -352,7 +352,7 @@ public class S3CachingDirectoryTest {
         ManifestManager manager = new ManifestManager(manifestOptions, new NoopRemoteObjectStore(), metadata);
         return new S3CachingDirectory(
                 new S3DirectoryOptions(tempDir, indexName),
-                new S3LockFactory(),
+                new ProcessLocalLockFactory(),
                 manager,
                 List.of(IndexFileStatus.CLEAN, IndexFileStatus.PINNED),
                 false

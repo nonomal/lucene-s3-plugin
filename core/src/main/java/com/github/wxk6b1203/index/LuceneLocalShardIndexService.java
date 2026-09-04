@@ -15,7 +15,7 @@ import com.github.wxk6b1203.store.common.PathUtil;
 import com.github.wxk6b1203.store.directory.Hierarchy;
 import com.github.wxk6b1203.store.directory.S3CachingDirectory;
 import com.github.wxk6b1203.store.directory.S3DirectoryOptions;
-import com.github.wxk6b1203.store.directory.S3LockFactory;
+import com.github.wxk6b1203.store.directory.ProcessLocalLockFactory;
 import com.github.wxk6b1203.store.manifest.ManifestManager;
 import com.github.wxk6b1203.store.manifest.ManifestOptions;
 import com.github.wxk6b1203.store.object.RemoteObjectStore;
@@ -1255,7 +1255,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         String physicalIndexName = physicalIndexName(shardId);
         return new S3CachingDirectory(
                 new S3DirectoryOptions(basePath, physicalIndexName),
-                new S3LockFactory(),
+                new ProcessLocalLockFactory(),
                 openManifestManager(),
                 readableRemoteStatuses,
                 includeWalFiles,
