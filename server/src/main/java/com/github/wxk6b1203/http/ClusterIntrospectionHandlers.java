@@ -3,6 +3,7 @@ package com.github.wxk6b1203.http;
 import com.github.wxk6b1203.cluster.*;
 import com.github.wxk6b1203.index.LocalShardIndexService;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.store.directory.RemoteCacheStats;
@@ -210,7 +211,7 @@ final class ClusterIntrospectionHandlers {
                 ownerUnavailable++;
             }
             ShardId shardId = routing.shardId();
-            IndexCommitSnapshot snapshot = latestRemoteSnapshot(shardId);
+            IndexCommitSnapshotHeader snapshot = latestRemoteSnapshot(shardId);
             if (remoteSnapshotReady(shardId, snapshot)) {
                 remoteSnapshotReady++;
             }
@@ -255,7 +256,7 @@ final class ClusterIntrospectionHandlers {
     private Map<String, Object> shardStats(ClusterState state, ShardRouting routing) {
         ShardId shardId = routing.shardId();
         ClusterNode owner = state.nodes().get(routing.nodeId());
-        IndexCommitSnapshot snapshot = latestRemoteSnapshot(shardId);
+        IndexCommitSnapshotHeader snapshot = latestRemoteSnapshot(shardId);
         String physicalIndexName = physicalIndexName(shardId);
         long pendingUploads = pendingUploadCount(physicalIndexName);
         Map<String, Object> result = new LinkedHashMap<>();
@@ -267,8 +268,8 @@ final class ClusterIntrospectionHandlers {
         result.put("owner_live", owner != null);
         result.put("owner_term", routing.ownerTerm());
         result.put("allocation_epoch", routing.allocationEpoch());
-        result.put("latest_snapshot_generation", snapshot == null ? null : snapshot.getGeneration());
-        result.put("latest_snapshot_segment", snapshot == null ? null : snapshot.getSegmentFileName());
+        result.put("latest_snapshot_generation", snapshot == null ? null : snapshot.generation());
+        result.put("latest_snapshot_segment", snapshot == null ? null : snapshot.segmentFileName());
         result.put("remote_snapshot_ready", remoteSnapshotReady(shardId, snapshot));
         result.put("pending_uploads", pendingUploads);
         return result;
@@ -285,7 +286,7 @@ final class ClusterIntrospectionHandlers {
                 .count();
     }
 
-    private boolean remoteSnapshotReady(ShardId shardId, IndexCommitSnapshot snapshot) {
+    private boolean remoteSnapshotReady(ShardId shardId, IndexCommitSnapshotHeader snapshot) {
         if (snapshot == null) {
             return false;
         }
@@ -301,8 +302,8 @@ final class ClusterIntrospectionHandlers {
                         || metadata.getStatus() == IndexFileStatus.UPLOADING);
     }
 
-    private IndexCommitSnapshot latestRemoteSnapshot(ShardId shardId) {
-        return manifestMetadataManager.latestSnapshot(physicalIndexName(shardId));
+    private IndexCommitSnapshotHeader latestRemoteSnapshot(ShardId shardId) {
+        return manifestMetadataManager.latestSnapshotHeader(physicalIndexName(shardId));
     }
 
     private String physicalIndexName(ShardId shardId) {

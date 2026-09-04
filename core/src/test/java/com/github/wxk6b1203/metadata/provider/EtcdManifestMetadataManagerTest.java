@@ -1,13 +1,20 @@
 package com.github.wxk6b1203.metadata.provider;
 
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexFile;
+import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.etcd.EtcdManifestMetadataManager;
+import io.etcd.jetcd.ByteSequence;
 import io.etcd.jetcd.Client;
+import io.etcd.jetcd.options.GetOption;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -211,6 +218,125 @@ public class EtcdManifestMetadataManagerTest {
 
             assertNull(provider.fileMetadata("books__shard_0", "_0.si"));
             assertNotNull(provider.fileMetadata("books__shard_0", "segments_1"));
+        } finally {
+            client.close();
+        }
+    }
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    public void chunkedSnapshotsRoundTripThroughEtcd() {
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        String namespace = "test-manifest/" + UUID.randomUUID();
+        EtcdManifestMetadataManager provider = new EtcdManifestMetadataManager(
+                EtcdManifestMetadataManager.Options.builder().namespace(namespace).build(), client);
+        try {
+            String index = "books__shard_0";
+            List<IndexFileMetadata> files = new ArrayList<>();
+            for (int i = 0; i < 300; i++) {
+                String name = String.format("_%04d.cfs", i);
+                provider.commitFile(new IndexFile(index, name, 100, i));
+                provider.updateFileStatus(index, name, 1L, IndexFileStatus.UPLOADING);
+                provider.updateFileStatus(index, name, 1L, IndexFileStatus.CLEAN);
+                files.add(provider.fileMetadata(index, name));
+            }
+
+            long generation = provider.publishSnapshot(index, "segments_9", files);
+            assertEquals(1, generation);
+
+            // Header carries identity without the file list (3 chunks at 128 names each).
+            var header = provider.latestSnapshotHeader(index);
+            assertNotNull(header);
+            assertEquals(1, header.generation());
+            assertEquals(300, header.fileCount());
+            assertEquals("segments_9", header.segmentFileName());
+            assertEquals(1, provider.snapshotHeader(index, 1).generation());
+
+            // Full snapshot reassembles the files from index_file/ entries.
+            IndexCommitSnapshot snapshot = provider.snapshot(index, generation);
+            assertNotNull(snapshot);
+            assertEquals(300, snapshot.getFiles().size());
+            assertEquals("_0007.cfs", snapshot.getFiles().get(7).getName());
+            assertEquals(files.getFirst().getObjectKey(), snapshot.getFiles().getFirst().getObjectKey());
+            assertEquals(1, provider.listSnapshots(index).size());
+
+            // deleteSnapshot removes the header AND its name chunks.
+            provider.deleteSnapshot(index, generation);
+            assertNull(provider.snapshot(index, generation));
+            assertNull(provider.latestSnapshotHeader(index));
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    public void snapshotBeyondLegacySingleKeyLimitStillPublishes() {
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        String namespace = "test-manifest/" + UUID.randomUUID();
+        EtcdManifestMetadataManager provider = new EtcdManifestMetadataManager(
+                EtcdManifestMetadataManager.Options.builder().namespace(namespace).build(), client);
+        try {
+            String index = "books__shard_0";
+            // 6000 files x ~266 B = ~1.56 MB serialized: the legacy full-snapshot value already
+            // exceeded etcd's default 1.5 MB --max-request-bytes here and permanently broke
+            // every later commit for the shard.
+            int count = 6000;
+            List<IndexFileMetadata> files = new ArrayList<>(count);
+            List<IndexFile> batch = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                batch.add(new IndexFile(index, String.format("_%06d.cfs", i), 100, i));
+            }
+            // The snapshot reassembles file metadata from index_file/ entries at read time,
+            // so the entries must exist for the round trip below.
+            provider.commitFiles(batch);
+            for (IndexFile file : batch) {
+                files.add(provider.fileMetadata(index, file.name()));
+            }
+            long generation = provider.publishSnapshot(index, "segments_big", files);
+
+            var header = provider.latestSnapshotHeader(index);
+            assertNotNull(header);
+            assertEquals(count, header.fileCount());
+
+            IndexCommitSnapshot snapshot = provider.snapshot(index, generation);
+            assertNotNull(snapshot);
+            assertEquals(count, snapshot.getFiles().size());
+        } finally {
+            client.close();
+        }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "ETCD_TEST_ENDPOINTS", matches = ".+")
+    public void orphanSnapshotFileSweepRemovesOnlyUnreferencedChunks() {
+        Client client = Client.builder().endpoints(System.getenv("ETCD_TEST_ENDPOINTS")).build();
+        String namespace = "test-manifest/" + UUID.randomUUID();
+        EtcdManifestMetadataManager provider = new EtcdManifestMetadataManager(
+                EtcdManifestMetadataManager.Options.builder().namespace(namespace).build(), client);
+        try {
+            String index = "books__shard_0";
+            provider.commitFile(new IndexFile(index, "segments_1", 128, 7));
+            var metadata = provider.fileMetadata(index, "segments_1");
+            long generation = provider.publishSnapshot(index, "segments_1", List.of(metadata));
+
+            // Simulate a crash between chunk writes and header creation. Keys built by hand
+            // must use the normalized (leading-slash) namespace, exactly like the manager.
+            ByteSequence orphanChunk = ByteSequence.from(
+                    ("/" + namespace + "/snapshot_files/" + index + "/" + String.format("%020d", 999) + "/0000")
+                            .getBytes(StandardCharsets.UTF_8));
+            client.getKVClient().put(orphanChunk, ByteSequence.from("[\"ghost.cfs\"]".getBytes(StandardCharsets.UTF_8))).join();
+
+            provider.deleteOrphanSnapshotFiles(index);
+
+            long orphans = client.getKVClient()
+                    .get(ByteSequence.from(("/" + namespace + "/snapshot_files/" + index + "/").getBytes(StandardCharsets.UTF_8)),
+                            GetOption.builder().isPrefix(true).build())
+                    .join().getKvs().stream()
+                    .filter(kv -> kv.getKey().toString(StandardCharsets.UTF_8).contains(String.format("%020d", 999)))
+                    .count();
+            assertEquals(0, orphans);
+            // Live snapshot chunks survive the sweep.
+            assertNotNull(provider.snapshot(index, generation));
         } finally {
             client.close();
         }

@@ -7,6 +7,7 @@ import com.github.wxk6b1203.config.ServerOptions;
 import com.github.wxk6b1203.errors.NotMasterException;
 import com.github.wxk6b1203.index.*;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
@@ -1070,7 +1071,7 @@ public class HttpApiServer implements AutoCloseable {
                 continue;
             }
             String physicalIndexName = physicalIndexName(target.shardId());
-            if (manifestMetadataManager.snapshot(physicalIndexName, generation) == null) {
+            if (manifestMetadataManager.snapshotHeader(physicalIndexName, generation) == null) {
                 continue;
             }
             String pinId = "search-" + UUID.randomUUID();
@@ -1122,7 +1123,8 @@ public class HttpApiServer implements AutoCloseable {
             load.merge(node.id(), 1, Integer::sum);
             // The readiness flag is cached (it only flips false->true), but the generation must be
             // fetched live so a weak read immediately after a write sees the freshest snapshot.
-            IndexCommitSnapshot snapshot = manifestMetadataManager.latestSnapshot(physicalIndexName(base.shardId()));
+            // Header-only read: the full file list is never needed to route the request.
+            IndexCommitSnapshotHeader snapshot = manifestMetadataManager.latestSnapshotHeader(physicalIndexName(base.shardId()));
             return new SearchShardTarget(
                     base.shardId(),
                     node.id(),
@@ -1131,7 +1133,7 @@ public class HttpApiServer implements AutoCloseable {
                     routing.ownerTerm(),
                     routing.allocationEpoch(),
                     true,
-                    snapshot == null ? -1L : snapshot.getGeneration()
+                    snapshot == null ? -1L : snapshot.generation()
             );
         }
         ClusterNode owner = state.nodes().get(routing.nodeId());

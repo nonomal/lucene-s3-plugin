@@ -2,6 +2,7 @@ package com.github.wxk6b1203.store.manifest;
 
 import com.github.wxk6b1203.metadata.common.CommittingIndexFile;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
@@ -104,6 +105,14 @@ public class ManifestManager implements AutoCloseable {
 
     public IndexCommitSnapshot latestSnapshot(String indexName) {
         return metadataManager.latestSnapshot(indexName);
+    }
+
+    public IndexCommitSnapshotHeader latestSnapshotHeader(String indexName) {
+        return metadataManager.latestSnapshotHeader(indexName);
+    }
+
+    public IndexCommitSnapshotHeader snapshotHeader(String indexName, long generation) {
+        return metadataManager.snapshotHeader(indexName, generation);
     }
 
     public IndexCommitSnapshot snapshot(String indexName, long generation) {
@@ -257,6 +266,8 @@ public class ManifestManager implements AutoCloseable {
     public void garbageCollectSnapshots(String indexName, int retainLatestCount) throws IOException {
         ensureRemoteObjectStore();
         metadataManager.deleteExpiredSnapshotPins(System.currentTimeMillis());
+        // Name chunks from a publish that crashed before its header landed are unreferenced.
+        metadataManager.deleteOrphanSnapshotFiles(indexName);
         List<IndexCommitSnapshot> snapshots = metadataManager.listSnapshots(indexName).stream()
                 .sorted(Comparator.comparingLong(IndexCommitSnapshot::getGeneration).reversed())
                 .toList();

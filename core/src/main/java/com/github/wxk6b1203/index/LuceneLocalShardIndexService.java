@@ -6,6 +6,7 @@ import com.github.wxk6b1203.cluster.IndexSettings;
 import com.github.wxk6b1203.cluster.ShardId;
 import com.github.wxk6b1203.cluster.ShardState;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
@@ -281,11 +282,11 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
     private SearchResponse searchRemoteSnapshot(ShardId shardId, SearchRequest request, long started) throws IOException {
         Long generation = request.remoteSnapshotGeneration();
         if (generation == null) {
-            IndexCommitSnapshot snapshot = metadataManager.latestSnapshot(physicalIndexName(shardId));
+            IndexCommitSnapshotHeader snapshot = metadataManager.latestSnapshotHeader(physicalIndexName(shardId));
             if (snapshot == null) {
                 return emptySearchResponse(started);
             }
-            generation = snapshot.getGeneration();
+            generation = snapshot.generation();
         }
         if (generation < 0) {
             return emptySearchResponse(started);

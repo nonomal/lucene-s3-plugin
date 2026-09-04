@@ -3,6 +3,7 @@ package com.github.wxk6b1203.metadata.provider.etcd;
 import com.github.wxk6b1203.errors.StorageException;
 import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
@@ -10,6 +11,7 @@ import com.github.wxk6b1203.metadata.common.ShardSummary;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
 import com.github.wxk6b1203.util.JsonUtil;
 import io.etcd.jetcd.ByteSequence;
+import tools.jackson.databind.JsonNode;
 import io.etcd.jetcd.Client;
 import io.etcd.jetcd.KeyValue;
 import io.etcd.jetcd.kv.GetResponse;
@@ -28,9 +30,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -42,6 +46,10 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     // (one Cmp + one Put), each read-only Op.get costs 1 op, so chunk under these limits.
     private static final int MAX_TXN_OPS = 128;
     private static final int CAS_CHUNK_SIZE = MAX_TXN_OPS / 2;
+    // Snapshot name chunks: 128 names ~ 3.5 KiB per value; 32 chunk puts (~112 KiB) per txn
+    // stays far under both the max-txn-ops and max-request-bytes limits.
+    private static final int NAMES_PER_CHUNK = 128;
+    private static final int CHUNKS_PER_TXN = 32;
 
     private final Client client;
     private final String namespace;
@@ -644,14 +652,31 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                 // numeric descending order; a limit-1 descending range get returns the highest
                 // generation without decoding every snapshot.
                 long generation = latestGeneration(indexName) + 1;
-                IndexCommitSnapshot snapshot = new IndexCommitSnapshot(
+                // The file list is stored as NAME CHUNKS under a separate prefix, not embedded in
+                // the header value: a full snapshot serialized into one key hit etcd's 1.5MB
+                // request limit at ~6000 files (266 B/file) and permanently broke all commits for
+                // the shard. Chunk values stay ~3.5 KiB; the file metadata itself is reassembled
+                // from the index_file/ keys at read time (single source of truth).
+                List<String> names = files.stream().map(IndexFileMetadata::getName).toList();
+                List<List<String>> nameChunks = partition(names, NAMES_PER_CHUNK);
+                for (int from = 0; from < nameChunks.size(); from += CHUNKS_PER_TXN) {
+                    int to = Math.min(from + CHUNKS_PER_TXN, nameChunks.size());
+                    Op[] puts = new Op[to - from];
+                    for (int i = from; i < to; i++) {
+                        puts[i - from] = Op.put(namesChunkKey(indexName, generation, i),
+                                ByteSequence.from(JsonUtil.writeValueAsBytes(nameChunks.get(i))), PutOption.DEFAULT);
+                    }
+                    await(client.getKVClient().txn().Then(puts).commit());
+                }
+                IndexCommitSnapshotHeader header = new IndexCommitSnapshotHeader(
                         indexName,
                         generation,
                         segmentFileName,
-                        files.stream().map(this::copyFileMetadata).toList(),
+                        names.size(),
+                        nameChunks.size(),
                         System.currentTimeMillis()
                 );
-                ByteSequence key = snapshotKey(indexName, generation);
+                ByteSequence headerKey = snapshotKey(indexName, generation);
                 SummaryVersion summary = summaryVersion(indexName);
                 ShardSummary updatedSummary = new ShardSummary(
                         summary.summary() == null ? 0 : summary.summary().pendingCount(),
@@ -659,14 +684,16 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                         System.currentTimeMillis()
                 );
                 ByteSequence summaryKey = shardStateKey(indexName);
+                // Header LAST: the snapshot becomes visible atomically with the summary update;
+                // a crash before this leaves unreferenced name chunks that the GC sweep removes.
                 boolean created = await(client.getKVClient()
                         .txn()
                         .If(
-                                new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0)),
+                                new Cmp(headerKey, Cmp.Op.EQUAL, CmpTarget.version(0)),
                                 summaryGuard(summaryKey, summary)
                         )
                         .Then(
-                                Op.put(key, ByteSequence.from(JsonUtil.writeValueAsBytes(snapshot)), PutOption.DEFAULT),
+                                Op.put(headerKey, ByteSequence.from(JsonUtil.writeValueAsBytes(header)), PutOption.DEFAULT),
                                 Op.put(summaryKey, ByteSequence.from(JsonUtil.writeValueAsBytes(updatedSummary)), PutOption.DEFAULT)
                         )
                         .commit())
@@ -682,18 +709,38 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     }
 
     @Override
+    public IndexCommitSnapshotHeader latestSnapshotHeader(String indexName) {
+        try {
+            KeyValue kv = latestSnapshotKv(indexName);
+            return kv == null ? null : decodeHeader(kv);
+        } catch (Exception e) {
+            throw storageException("Failed to get commit snapshot header: " + indexName, e);
+        }
+    }
+
+    @Override
+    public IndexCommitSnapshotHeader snapshotHeader(String indexName, long generation) {
+        try {
+            KeyValue kv = fileKv(snapshotKey(indexName, generation));
+            return kv == null ? null : decodeHeader(kv);
+        } catch (Exception e) {
+            throw storageException("Failed to get commit snapshot header: " + indexName + "/" + generation, e);
+        }
+    }
+
+    @Override
     public IndexCommitSnapshot latestSnapshot(String indexName) {
         try {
             KeyValue kv = latestSnapshotKv(indexName);
-            return kv == null ? null : decodeSnapshot(kv);
+            return kv == null ? null : assembleSnapshot(kv);
         } catch (Exception e) {
             throw storageException("Failed to get latest commit snapshot: " + indexName, e);
         }
     }
 
     private long latestGeneration(String indexName) throws Exception {
-        KeyValue kv = latestSnapshotKv(indexName);
-        return kv == null ? 0 : decodeSnapshot(kv).getGeneration();
+        IndexCommitSnapshotHeader header = latestSnapshotHeader(indexName);
+        return header == null ? 0 : header.generation();
     }
 
     private KeyValue latestSnapshotKv(String indexName) throws Exception {
@@ -710,8 +757,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public IndexCommitSnapshot snapshot(String indexName, long generation) {
         try {
-            var response = await(client.getKVClient().get(snapshotKey(indexName, generation)));
-            return response.getKvs().isEmpty() ? null : decodeSnapshot(response.getKvs().getFirst());
+            KeyValue kv = fileKv(snapshotKey(indexName, generation));
+            return kv == null ? null : assembleSnapshot(kv);
         } catch (Exception e) {
             throw storageException("Failed to get commit snapshot: " + indexName + "/" + generation, e);
         }
@@ -724,7 +771,7 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                     .get(snapshotPrefix(indexName), GetOption.builder().isPrefix(true).build()));
             List<IndexCommitSnapshot> result = new ArrayList<>();
             for (KeyValue item : response.getKvs()) {
-                result.add(decodeSnapshot(item));
+                result.add(assembleSnapshot(item));
             }
             return result.stream()
                     .sorted(Comparator.comparingLong(IndexCommitSnapshot::getGeneration))
@@ -737,10 +784,61 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
     @Override
     public void deleteSnapshot(String indexName, long generation) {
         try {
-            await(client.getKVClient().delete(snapshotKey(indexName, generation)));
+            await(client.getKVClient()
+                    .txn()
+                    .Then(
+                            Op.delete(snapshotKey(indexName, generation), DeleteOption.DEFAULT),
+                            Op.delete(namesPrefix(indexName, generation),
+                                    DeleteOption.builder().isPrefix(true).build())
+                    )
+                    .commit());
         } catch (Exception e) {
             throw storageException("Failed to delete commit snapshot: " + indexName + "/" + generation, e);
         }
+    }
+
+    @Override
+    public void deleteOrphanSnapshotFiles(String indexName) {
+        try {
+            String headerMarker = (namespace + "/snapshot/" + indexName + "/");
+            String namesMarker = (namespace + "/snapshot_files/" + indexName + "/");
+            Set<Long> liveGenerations = new HashSet<>();
+            var headers = await(client.getKVClient()
+                    .get(snapshotPrefix(indexName), GetOption.builder()
+                            .isPrefix(true)
+                            .withKeysOnly(true)
+                            .build()));
+            for (KeyValue kv : headers.getKvs()) {
+                // Header key suffix is "{generation}"; names key suffix is "{generation}/{chunk}".
+                liveGenerations.add(generationAfter(kv.getKey().toString(StandardCharsets.UTF_8), headerMarker));
+            }
+            // Keys only: the sweep runs every GC tick and must not transfer chunk values.
+            var names = await(client.getKVClient()
+                    .get(namesRootPrefix(indexName), GetOption.builder()
+                            .isPrefix(true)
+                            .withKeysOnly(true)
+                            .build()));
+            Set<Long> orphanGenerations = new HashSet<>();
+            for (KeyValue kv : names.getKvs()) {
+                long generation = generationAfter(kv.getKey().toString(StandardCharsets.UTF_8), namesMarker);
+                if (!liveGenerations.contains(generation)) {
+                    orphanGenerations.add(generation);
+                }
+            }
+            for (Long generation : orphanGenerations) {
+                await(client.getKVClient().delete(namesPrefix(indexName, generation),
+                        DeleteOption.builder().isPrefix(true).build()));
+            }
+        } catch (Exception e) {
+            throw storageException("Failed to sweep orphan snapshot files: " + indexName, e);
+        }
+    }
+
+    /** First path segment after the marker: the generation (chunk key or header key alike). */
+    private static long generationAfter(String fullKey, String marker) {
+        String relative = fullKey.substring(marker.length());
+        int slash = relative.indexOf('/');
+        return Long.parseLong(slash < 0 ? relative : relative.substring(0, slash));
     }
 
     @Override
@@ -842,6 +940,8 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
             await(client.getKVClient()
                     .delete(snapshotPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
             await(client.getKVClient()
+                    .delete(namesRootPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
+            await(client.getKVClient()
                     .delete(pinPrefix(indexName), DeleteOption.builder().isPrefix(true).build()));
             await(client.getKVClient()
                     .delete(shardStateKey(indexName)));
@@ -875,6 +975,59 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
                 .Then(Op.delete(currentKv.getKey(), DeleteOption.DEFAULT))
                 .commit())
                 .isSucceeded();
+    }
+
+    /**
+     * Rebuild the full snapshot from its header + name chunks + live index_file/ entries. A
+     * header without a "fileCount" field is a legacy full-snapshot value (pre-chunking format)
+     * and is returned as-is.
+     */
+    private IndexCommitSnapshot assembleSnapshot(KeyValue headerKv) throws Exception {
+        byte[] raw = headerKv.getValue().getBytes();
+        JsonNode node = JsonUtil.readValue(raw, JsonNode.class);
+        if (node.has("files")) {
+            return JsonUtil.readValue(raw, IndexCommitSnapshot.class);
+        }
+        IndexCommitSnapshotHeader header = JsonUtil.readValue(raw, IndexCommitSnapshotHeader.class);
+        List<String> names = new ArrayList<>(header.fileCount());
+        var response = await(client.getKVClient()
+                .get(namesPrefix(header.indexName(), header.generation()),
+                        GetOption.builder()
+                                .isPrefix(true)
+                                .withSortField(GetOption.SortTarget.KEY)
+                                .withSortOrder(GetOption.SortOrder.ASCEND)
+                                .build()));
+        for (KeyValue kv : response.getKvs()) {
+            names.addAll(List.of(JsonUtil.readValue(kv.getValue().getBytes(), String[].class)));
+        }
+        Map<String, IndexFileMetadata> byName = filesByName(header.indexName(), names);
+        List<IndexFileMetadata> files = new ArrayList<>(names.size());
+        for (String name : names) {
+            IndexFileMetadata metadata = byName.get(name);
+            if (metadata == null) {
+                throw new StorageException("Snapshot " + header.indexName() + "/" + header.generation()
+                        + " references missing file metadata: " + name);
+            }
+            files.add(copyFileMetadata(metadata));
+        }
+        return new IndexCommitSnapshot(header.indexName(), header.generation(), header.segmentFileName(), files, header.createdAtMillis());
+    }
+
+    private IndexCommitSnapshotHeader decodeHeader(KeyValue kv) {
+        byte[] raw = kv.getValue().getBytes();
+        JsonNode node = JsonUtil.readValue(raw, JsonNode.class);
+        if (node.has("files")) {
+            return IndexCommitSnapshotHeader.of(JsonUtil.readValue(raw, IndexCommitSnapshot.class));
+        }
+        return JsonUtil.readValue(raw, IndexCommitSnapshotHeader.class);
+    }
+
+    private static <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> chunks = new ArrayList<>();
+        for (int from = 0; from < list.size(); from += size) {
+            chunks.add(list.subList(from, Math.min(from + size, list.size())));
+        }
+        return chunks;
     }
 
     private IndexFileMetadata decodeFileMetadata(KeyValue kv) {
@@ -917,6 +1070,19 @@ public class EtcdManifestMetadataManager extends ManifestMetadataManager {
 
     private ByteSequence snapshotKey(String indexName, long generation) {
         return key("snapshot/" + indexName + "/" + String.format("%020d", generation));
+    }
+
+    private ByteSequence namesRootPrefix(String indexName) {
+        return key("snapshot_files/" + indexName + "/");
+    }
+
+    private ByteSequence namesPrefix(String indexName, long generation) {
+        return key("snapshot_files/" + indexName + "/" + String.format("%020d", generation) + "/");
+    }
+
+    private ByteSequence namesChunkKey(String indexName, long generation, int chunk) {
+        return key("snapshot_files/" + indexName + "/" + String.format("%020d", generation)
+                + "/" + String.format("%04d", chunk));
     }
 
     private ByteSequence pinPrefix(String indexName) {

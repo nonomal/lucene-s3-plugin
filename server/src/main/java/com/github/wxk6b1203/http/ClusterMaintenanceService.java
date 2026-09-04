@@ -3,6 +3,7 @@ package com.github.wxk6b1203.http;
 import com.github.wxk6b1203.cluster.*;
 import com.github.wxk6b1203.index.LocalShardIndexService;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.provider.ManifestMetadataManager;
@@ -368,7 +369,7 @@ final class ClusterMaintenanceService {
                 .mapToLong(file -> Math.max(0, now.toEpochMilli() - file.getModifiedTime()))
                 .max()
                 .orElse(0);
-        IndexCommitSnapshot latestSnapshot = manifestMetadataManager.latestSnapshot(physicalIndexName);
+        IndexCommitSnapshotHeader latestSnapshot = manifestMetadataManager.latestSnapshotHeader(physicalIndexName);
         ShardRouting routing = routing(state, indexName, shard);
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("index", indexName);
@@ -383,8 +384,8 @@ final class ClusterMaintenanceService {
         result.put("oldest_pending_age_millis", oldestPendingAgeMillis);
         result.put("stuck", !pending.isEmpty() && oldestPendingAgeMillis >= STUCK_PENDING_UPLOAD_MILLIS);
         result.put("remote_snapshot_ready", pending.isEmpty() && latestSnapshot != null);
-        result.put("latest_snapshot_generation", latestSnapshot == null ? null : latestSnapshot.getGeneration());
-        result.put("latest_snapshot_segment", latestSnapshot == null ? null : latestSnapshot.getSegmentFileName());
+        result.put("latest_snapshot_generation", latestSnapshot == null ? null : latestSnapshot.generation());
+        result.put("latest_snapshot_segment", latestSnapshot == null ? null : latestSnapshot.segmentFileName());
         result.put("pending_file_details", pending.stream().map(this::pendingFile).toList());
         return result;
     }

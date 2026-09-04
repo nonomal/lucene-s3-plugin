@@ -1,8 +1,9 @@
 package com.github.wxk6b1203.metadata.provider;
 
-import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshot;
+import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotHeader;
 import com.github.wxk6b1203.metadata.common.IndexCommitSnapshotPin;
+import com.github.wxk6b1203.metadata.common.IndexFile;
 import com.github.wxk6b1203.metadata.common.IndexFileMetadata;
 import com.github.wxk6b1203.metadata.common.IndexFileStatus;
 import com.github.wxk6b1203.metadata.common.ShardSummary;
@@ -144,10 +145,10 @@ public abstract class ManifestMetadataManager {
      */
     public void reconcileShardSummary(String indexName) {
         int pending = listAll(indexName, List.of(IndexFileStatus.DIRTY, IndexFileStatus.UPLOADING)).size();
-        IndexCommitSnapshot snapshot = latestSnapshot(indexName);
+        IndexCommitSnapshotHeader header = latestSnapshotHeader(indexName);
         putShardSummary(indexName, new ShardSummary(
                 pending,
-                snapshot == null ? 0 : snapshot.getGeneration(),
+                header == null ? 0 : header.generation(),
                 System.currentTimeMillis()
         ));
     }
@@ -185,6 +186,30 @@ public abstract class ManifestMetadataManager {
     }
 
     public abstract long publishSnapshot(String indexName, String segmentFileName, List<IndexFileMetadata> files);
+
+    /**
+     * Snapshot identity without the file list. Hot paths (hybrid read targets, readiness,
+     * generation probes) need only the generation/segment name; the default derives the header
+     * from the full snapshot, etcd-backed stores override with a header-key-only read so the
+     * file list is neither transferred nor decoded.
+     */
+    public IndexCommitSnapshotHeader latestSnapshotHeader(String indexName) {
+        IndexCommitSnapshot snapshot = latestSnapshot(indexName);
+        return snapshot == null ? null : IndexCommitSnapshotHeader.of(snapshot);
+    }
+
+    /** Header-only variant of {@link #snapshot(String, long)}; same default/override split. */
+    public IndexCommitSnapshotHeader snapshotHeader(String indexName, long generation) {
+        IndexCommitSnapshot snapshot = snapshot(indexName, generation);
+        return snapshot == null ? null : IndexCommitSnapshotHeader.of(snapshot);
+    }
+
+    /**
+     * Delete name-chunk keys left behind by a publish that crashed between writing chunks and
+     * creating the snapshot header. No-op default for stores where that cannot happen.
+     */
+    public void deleteOrphanSnapshotFiles(String indexName) {
+    }
 
     public abstract IndexCommitSnapshot latestSnapshot(String indexName);
 
