@@ -2728,6 +2728,7 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         private final IndexSearcher searcher;
         private final AtomicInteger references = new AtomicInteger();
         private volatile boolean closed;
+        private volatile boolean physicallyClosed;
         private volatile long lastAccessNanos = System.nanoTime();
 
         private CachedRemoteSearcher(
@@ -2750,8 +2751,19 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
             return true;
         }
 
-        private void release() {
-            references.decrementAndGet();
+        private synchronized void release() {
+            if (references.decrementAndGet() <= 0) {
+                references.set(0);
+                lastAccessNanos = System.nanoTime();
+                if (closed) {
+                    // close() was deferred while this search was in flight.
+                    try {
+                        closeNow();
+                    } catch (IOException e) {
+                        log.warn("failed to close evicted remote searcher", e);
+                    }
+                }
+            }
         }
 
         private IndexSearcher searcher() {
@@ -2764,10 +2776,21 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
 
         @Override
         public synchronized void close() throws IOException {
-            if (closed) {
+            closed = true;
+            if (references.get() > 0) {
+                // A search acquired this searcher between the eviction's expired() check and
+                // remove(): closing the reader/directory now would pull it out from under the
+                // running query. The final release() performs the physical close.
                 return;
             }
-            closed = true;
+            closeNow();
+        }
+
+        private void closeNow() throws IOException {
+            if (physicallyClosed) {
+                return;
+            }
+            physicallyClosed = true;
             IOException failure = null;
             try {
                 reader.close();
