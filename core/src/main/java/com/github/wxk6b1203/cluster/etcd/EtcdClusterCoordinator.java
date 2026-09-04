@@ -30,6 +30,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Slf4j
 public class EtcdClusterCoordinator implements ClusterCoordinator {
@@ -47,6 +48,11 @@ public class EtcdClusterCoordinator implements ClusterCoordinator {
             Thread.ofVirtual().name("cluster-coordinator-", 0).factory()
     );
     private final AtomicBoolean master = new AtomicBoolean(false);
+    // Re-verification of the cached mastership flag is rate-limited: under load, thousands of
+    // requests hit isMaster() per second and the old per-call linearizable GET turned every one
+    // of them into an etcd RPC. 500ms bounds deposal staleness well below the master lease TTL.
+    private static final long MASTER_VERIFY_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private final AtomicLong lastMasterVerifyNanos = new AtomicLong();
     private final long rebalanceFallbackIntervalNanos;
     private long nodeLeaseId;
     private long masterLeaseId;
@@ -107,15 +113,26 @@ public class EtcdClusterCoordinator implements ClusterCoordinator {
         if (!masterEligible || !master.get()) {
             return false;
         }
+        // The flag is maintained by safeTick()'s campaign transaction (every max(1, ttl/3)s);
+        // here we only re-verify at most once per interval. A single thread performs the check
+        // (CAS on the last-verify timestamp), all others answer from the cached flag.
+        long now = System.nanoTime();
+        long last = lastMasterVerifyNanos.get();
+        if (now - last >= MASTER_VERIFY_INTERVAL_NANOS && lastMasterVerifyNanos.compareAndSet(last, now)) {
+            verifyMastership();
+        }
+        return master.get();
+    }
+
+    private void verifyMastership() {
         try {
             var response = client.getKVClient().get(key("master")).get(1, TimeUnit.SECONDS);
-            boolean ownsLeaseKey = !response.getKvs().isEmpty()
-                    && localNode.id().equals(response.getKvs().getFirst().getValue().toString(StandardCharsets.UTF_8));
-            master.set(ownsLeaseKey);
-            return ownsLeaseKey;
+            master.set(!response.getKvs().isEmpty()
+                    && localNode.id().equals(response.getKvs().getFirst().getValue().toString(StandardCharsets.UTF_8)));
         } catch (Exception e) {
-            master.set(false);
-            return false;
+            // A failed verification must not flip mastership on transient network jitter: the
+            // tick campaign remains the authority and corrects the flag within one interval.
+            log.debug("master re-verification failed; keeping cached flag for node {}", localNode.id(), e);
         }
     }
 
