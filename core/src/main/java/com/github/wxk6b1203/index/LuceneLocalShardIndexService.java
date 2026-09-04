@@ -131,7 +131,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
             } else {
                 shardWriter.writer.updateDocument(new Term("_id", id), document);
             }
-            finishWrite(shardWriter, 1);
+            try {
+                finishWrite(shardWriter, 1);
+            } catch (IOException e) {
+                rollbackAfterFailedCommit(request.shardId(), shardWriter);
+                throw e;
+            }
         }
         return new IndexDocumentResponse(
                 request.indexName(),
@@ -150,7 +155,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         ShardWriter shardWriter = writers.computeIfAbsent(request.shardId(), this::openShardWriter);
         synchronized (shardWriter) {
             shardWriter.writer.deleteDocuments(new Term("_id", request.id()));
-            finishWrite(shardWriter, 1);
+            try {
+                finishWrite(shardWriter, 1);
+            } catch (IOException e) {
+                rollbackAfterFailedCommit(request.shardId(), shardWriter);
+                throw e;
+            }
         }
         return new IndexDocumentResponse(request.indexName(), request.shardId(), request.id(), "deleted", true);
     }
@@ -222,6 +232,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                 try {
                     finishWrite(shardWriter, successfulPositions.size());
                 } catch (Exception e) {
+                    if (shardWriter.uncommittedOperations.get() > 0) {
+                        // The local commit itself failed: the accepted operations stay buffered
+                        // in the writer while every one of them was reported as failed. Roll
+                        // them back so they cannot leak into a later successful commit.
+                        rollbackAfterFailedCommit(shardId, shardWriter);
+                    }
                     for (Integer position : successfulPositions) {
                         results.set(position, IndexDocumentOperationResult.failure(e));
                     }
@@ -800,7 +816,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                 deleted = new IndexSearcher(reader).count(query);
             }
             shardWriter.writer.deleteDocuments(query);
-            finishWrite(shardWriter, deleted > 0 ? saturatedInt(deleted) : 0);
+            try {
+                finishWrite(shardWriter, deleted > 0 ? saturatedInt(deleted) : 0);
+            } catch (IOException e) {
+                rollbackAfterFailedCommit(shardId, shardWriter);
+                throw e;
+            }
         }
         return new ByQueryResponse(null, "delete_by_query", "deleted=" + deleted);
     }
@@ -835,7 +856,12 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
                     after = topDocs.scoreDocs[topDocs.scoreDocs.length - 1];
                 }
             }
-            finishWrite(shardWriter, updated > 0 ? saturatedInt(updated) : 0);
+            try {
+                finishWrite(shardWriter, updated > 0 ? saturatedInt(updated) : 0);
+            } catch (IOException e) {
+                rollbackAfterFailedCommit(shardId, shardWriter);
+                throw e;
+            }
         }
         return new ByQueryResponse(null, "update_by_query", "updated=" + updated);
     }
@@ -1188,6 +1214,34 @@ public class LuceneLocalShardIndexService implements LocalShardIndexService {
         try (ManifestManager manifestManager = openManifestManager()) {
             manifestManager.discardPendingUploads(physicalIndexName(shardId));
         }
+    }
+
+    /**
+     * Discard buffered-but-uncommitted mutations after the local Lucene commit failed. Every
+     * affected operation was reported as failed to its caller, so they must not silently leak
+     * into a later successful commit (create-only retries would also spuriously collide).
+     * Only valid when uncommittedOperations > 0, i.e. writer.commit() never completed; when
+     * the commit succeeded but the manifest publish failed, the pending commit is instead
+     * redriven by WRITE_MAINTENANCE/WRITER_RECONCILE (snapshotPublishPending stays set).
+     */
+    private void rollbackAfterFailedCommit(ShardId shardId, ShardWriter shardWriter) {
+        if (!writers.remove(shardId, shardWriter)) {
+            return;
+        }
+        try {
+            synchronized (shardWriter) {
+                // Discards every change since the last successful commit and closes the writer.
+                shardWriter.writer.rollback();
+            }
+        } catch (Exception e) {
+            log.warn("failed to roll back shard writer for {} after a failed commit", shardId.routeKey(), e);
+        }
+        try {
+            shardWriter.close();
+        } catch (IOException e) {
+            log.warn("failed to release shard resources for {} after rollback", shardId.routeKey(), e);
+        }
+        log.warn("rolled back uncommitted writes for {} after a failed local commit; the shard writer will be reopened on next use", shardId.routeKey());
     }
 
     private ShardWriter openShardWriter(ShardId shardId) {
