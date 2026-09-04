@@ -44,7 +44,6 @@ import java.util.stream.Collectors;
 
 @Slf4j
 public class ManifestManager implements AutoCloseable {
-    private static final long IN_FLIGHT_POLL_INTERVAL_MILLIS = 20L;
     private static final long COMPACTION_GRACE_MILLIS = Duration.ofMinutes(10).toMillis();
     private static final ConcurrentHashMap<UploadKey, CompletableFuture<Void>> IN_FLIGHT_UPLOADS = new ConcurrentHashMap<>();
 
@@ -565,27 +564,34 @@ public class ManifestManager implements AutoCloseable {
             if (existing == null) {
                 return true;
             }
-            // Another upload for the same content is in flight; wait for it to finish rather than
-            // hammering the metadata store. Re-check metadata occasionally so we don't wait the
-            // full timeout if the in-flight upload already succeeded but the slot wasn't cleared.
-            IndexFileMetadata current = metadataManager.fileMetadata(metadata.getIndexName(), metadata.getName());
-            if (sameMetadataIdentity(metadata, current) && remoteReadable(current.getStatus())) {
-                return false;
-            }
+            // Another upload for the same content is in flight; wait out the FULL remaining time.
+            // The future completes in releaseUploadSlot's finally, so we wake the moment the
+            // in-flight upload finishes. The old loop polled every 20ms AND re-read metadata on
+            // every tick, costing each waiter ~50 etcd GETs per second for the whole wait.
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0) {
                 return false;
             }
             try {
-                existing.get(Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(IN_FLIGHT_POLL_INTERVAL_MILLIS)),
-                        TimeUnit.NANOSECONDS);
-            } catch (TimeoutException ignored) {
-                // Poll again: re-check metadata and re-attempt slot acquisition.
+                existing.get(remainingNanos, TimeUnit.NANOSECONDS);
+            } catch (TimeoutException e) {
+                // Deadline hit while the other upload was still running.
+                return false;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return false;
             } catch (ExecutionException ignored) {
                 // The in-flight upload failed; loop to acquire the slot ourselves.
+            }
+            // The uploader finished: skip our own put when it already published a remote-readable
+            // entry. One metadata read per completion instead of one per poll tick.
+            try {
+                IndexFileMetadata current = metadataManager.fileMetadata(metadata.getIndexName(), metadata.getName());
+                if (sameMetadataIdentity(metadata, current) && remoteReadable(current.getStatus())) {
+                    return false;
+                }
+            } catch (RuntimeException e) {
+                // Metadata read failed: fall through and try to acquire the slot ourselves.
             }
         }
     }
