@@ -43,6 +43,30 @@ public class ClusterIndexServiceTest {
     }
 
     @Test
+    public void rejectsInvalidIndexNames() throws Exception {
+        InMemoryClusterStateRepository repository = new InMemoryClusterStateRepository(
+                "test", new ClusterNode("node-1", "node-1", "127.0.0.1", 9200,
+                        Set.of(NodeRole.MASTER, NodeRole.DATA), Instant.now()));
+        DefaultClusterIndexService service = new DefaultClusterIndexService(repository);
+
+        // Uppercase, whitespace, separators, shell/URL hazards, dot-only names, overlong.
+        List<String> invalid = List.of(
+                "Books", "bad name", "-lead", "_lead", "+lead", ".lead",
+                "a/b", "a\\b", "a?b", "a*b", "a:b", "..", ".", "", "   ",
+                "a".repeat(201));
+        for (String name : invalid) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.createIndex(new IndexSettings(name, 1, null, Instant.now())),
+                    "index name should be rejected: [" + name + "]");
+        }
+
+        // Valid names still create cleanly.
+        for (String name : List.of("books", "log-2024.01_01", "a1", "x")) {
+            service.createIndex(new IndexSettings(name, 1, null, Instant.now()));
+        }
+    }
+
+    @Test
     public void testCreateIndexAllocatesShardOwnersToDataNode() throws Exception {
         ClusterNode node = new ClusterNode(
                 "node-1",
