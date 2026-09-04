@@ -102,6 +102,19 @@ public class S3RemoteObjectStore implements RemoteObjectStore {
             int partNumber = 1;
             for (long offset = 0; offset < size; offset += partSize) {
                 long length = Math.min(partSize, size - offset);
+                // Repeatable body (byte[]): with chunked encoding disabled the SDK must re-read
+                // the payload to compute the signature hash, which a bare InputStream cannot do.
+                byte[] chunk = new byte[(int) length];
+                try (InputStream in = partStream(source, offset, length)) {
+                    int read = 0;
+                    while (read < length) {
+                        int n = in.read(chunk, read, (int) length - read);
+                        if (n == -1) {
+                            throw new IOException("short read from " + source + " at " + (offset + read));
+                        }
+                        read += n;
+                    }
+                }
                 UploadPartResponse part = s3Client.uploadPart(
                         UploadPartRequest.builder()
                                 .bucket(bucket)
@@ -109,7 +122,7 @@ public class S3RemoteObjectStore implements RemoteObjectStore {
                                 .uploadId(uploadId)
                                 .partNumber(partNumber)
                                 .build(),
-                        RequestBody.fromInputStream(partStream(source, offset, length), length));
+                        RequestBody.fromBytes(chunk));
                 parts.add(CompletedPart.builder().partNumber(partNumber).eTag(part.eTag()).build());
                 partNumber++;
             }
